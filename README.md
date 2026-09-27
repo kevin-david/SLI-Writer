@@ -32,7 +32,24 @@ Save the original UID (usually the same if you order several tags from the same 
 
 Unfinalized Gen3 tags (with signature blocks `0x14 = A5 2B 44 2C` and `0x15 = 21 AE 93 00`) in **normal** mode.
 
-UID is automatically written to blocks `0x10` and `0x11` when Gen3 signature is detected.
+- **UID Mapping**: UID is stored across blocks `0x10` (`UID[7..4]`) and `0x11` (`UID[3..0]`), which are written and individually verified via readback.
+- **Tonie 8x4 Layout & UID Requirement**: Source `.nfc` files must strictly have 8 blocks × 4 bytes (32 bytes user data) and a UID beginning with `E0 04 03` (standard Toniebox UID prefix). Restricting writes to 8 blocks guarantees that writing user data will never overwrite or corrupt the UID registers (`0x10`/`0x11`) or magic signature blocks (`0x14`/`0x15`).
+- **No Auto-Finalize (Reusable Magic State)**: The app intentionally does **not** lock or finalize Gen3 tags (it never sends finalization or lock commands). Tags remain in their unfinalized magic state so that UIDs and data blocks can be rewritten indefinitely.
+
+---
+
+## ⚠️ Important Constraints
+
+### Single-Tag-in-Field Requirement
+All ISO15693 operations (both Normal and Special modes) require that **only one tag is present in the Flipper's RF field at a time**:
+- Non-addressed commands (such as `0x02` block write and Gen2 vendor commands `0x40`/`0x41`) broadcast to every tag in the field.
+- Even addressed commands (`0x62`) and inventory checks cannot differentiate between two magic tags sharing the same factory or target UID.
+- Always remove other tags before reading, saving special UIDs, or writing.
+
+### Gen2 Layout Command Omitted
+The Gen2 layout command (`0x47`) is **intentionally NOT sent**:
+- Not required for most readers.
+- **Will brick SLIX-L magic cards.**
 
 ---
 
@@ -40,29 +57,35 @@ UID is automatically written to blocks `0x10` and `0x11` when Gen3 signature is 
 
 ### Normal mode
 
-#### 1. Pre-Write Safety & Auto-Detection
-Before issuing any write commands, the app performs a tri-state check on signature blocks `0x14` and `0x15`:
-- **`GEN3_UNKNOWN`**: If either block cannot be reliably read due to RF loss/timeouts, the write is immediately aborted to prevent bricking.
+#### 1. Pre-Write Safety & Tri-State Auto-Detection
+Before issuing any write commands, the app queries signature blocks `0x14` and `0x15`:
 - **`GEN3_YES` (`0x14 == A5 2B 44 2C` and `0x15 == 21 AE 93 00`)**:
-  - Validates source `.nfc` layout: strictly requires 8 blocks × 4 bytes and UID starting with `E0 04 03` (Tonie layout) to prevent overwriting vendor blocks.
-- **`GEN3_NO`**: Standard / Gen2 ISO15693 tag.
+  - Confirmed unfinalized Gen3 magic tag.
+  - Validates source `.nfc` layout: strictly requires 8 blocks × 4 bytes and UID starting with `E0 04 03` (Tonie layout) before proceeding.
+- **`GEN3_NO`**:
+  - Proven standard / Gen2 tag. Strictly requires both signature blocks to return explicit ISO15693 `Unsupported` error codes (`0x10` block not available, or `0x01`/`0x02` not supported) **and** system information reporting memory $\le 8$ blocks. Only this proven non-Gen3 case authorizes legacy Gen2 writes.
+- **`GEN3_UNKNOWN` (Fail-Closed Safety)**:
+  - If any communication error, timeout, malformed frame, generic card error (`0x0F`), partial signature match (one block matches but not the other), failed system information query, or system information reporting $\ge 80$ blocks occurs, the tag cannot be safely classified.
+  - The write is **immediately aborted** with `"Cannot safely identify tag"`, preventing legacy Gen2 backdoor commands (`0x40`/`0x41`) from being sent to an unfinalized or finalized Gen3 tag.
 
 #### 2. Write Data Blocks
-- Command: `WRITE_SINGLE_BLOCK` (`0x21`), non-addressed, flags `0x02` (clamped to max 8 blocks on Gen3).
+- Command: `WRITE_SINGLE_BLOCK` (`0x21`), non-addressed, flags `0x02` (retries with Option flag `0x42` if write ACK is dropped).
+- Every block is strictly verified via byte-for-byte readback.
+- On Gen3 tags, signature blocks `0x14` and `0x15` are re-verified after data writes to confirm they remain intact.
 
 #### 3. Write & Verify UID
 - **Gen3**:
-  1. Re-verifies signature blocks `0x14` and `0x15` to ensure they were never altered by block writes.
-  2. Writes block `0x10` (`<uid[7..4]>`) and reads back to verify.
-  3. Writes block `0x11` (`<uid[3..0]>`) and reads back to verify.
-  4. Runs inventory and strictly compares the reported UID against the target UID.
+  1. Writes block `0x10` (`<uid[7..4]>`) and verifies via readback.
+  2. Writes block `0x11` (`<uid[3..0]>`) and verifies via readback. If block `0x10` succeeded but `0x11` fails, reports `Partial UID written!` to warn of a split UID state.
+  3. Resynchronizes card to Ready state and runs ISO15693 inventory, strictly comparing canonical MSB-first UID against target UID.
 - **Gen2 Fallback**:
-  Uses Gen2 vendor commands:
+  Only executed if `GEN3_NO` was explicitly established:
   ```
   02 E0 09 40 <uid_high>   → sets bytes 0–3
   02 E0 09 41 <uid_low>    → sets bytes 4–7
   ```
   Equivalent to `proxmark hf 15 csetuid -u <uid> --v2`.
+  Followed by inventory readback verification.
 
 ---
 
@@ -98,14 +121,6 @@ Example for UID `E0 07 81 2B 4F 10 4B 15`, block 0, data `11 11 11 11`:
 02 E0 09 40 <target_uid_high>
 02 E0 09 41 <target_uid_low>
 ```
-
----
-
-### ⚠️ Important
-
-The Gen2 layout command (`0x47`) is **intentionally NOT sent**.
-- Not required for most readers
-- **Will brick SLIX-L magic cards**
 
 ---
 
