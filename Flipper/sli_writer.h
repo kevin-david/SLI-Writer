@@ -60,6 +60,7 @@ typedef enum {
     WriteResultUidReadbackUnavailable,
     WriteResultUidMismatch,
     WriteResultSaveUidFailed,
+    WriteResultGen3UidPartial,
     WriteResultUnknown,
 } WriteResult;
 

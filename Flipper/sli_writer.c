@@ -284,8 +284,9 @@ static WriteResult magic_write_uid(Iso15693_3Poller* iso, const uint8_t uid_msb[
 
 typedef enum {
     BlockReadOk = 0,
-    BlockReadCardError,   /* Card answered with ISO15693 error flag (e.g. block not supported) */
-    BlockReadCommError,   /* Timeout, RF lost, collision, or unparseable response */
+    BlockReadUnsupported, /* Card answered with ISO15693 error: block not available (0x10) or command not supported (0x01/0x02) */
+    BlockReadCardError,   /* Other card error response */
+    BlockReadCommError,   /* Timeout, RF lost, collision, or malformed/truncated response */
 } BlockReadResult;
 
 typedef enum {
@@ -312,18 +313,31 @@ static BlockReadResult read_single_block(
         }
 
         Iso15693_3Error err = iso15693_3_poller_send_frame(iso, tx, rx, ISO15693_FWT_FC);
+        size_t rx_bits = bit_buffer_get_size(rx);
         size_t rx_bytes = bit_buffer_get_size_bytes(rx);
 
         if(err == Iso15693_3ErrorNone && rx_bytes >= 1) {
             uint8_t flags = bit_buffer_get_byte(rx, 0);
             if(flags & 0x01) {
-                /* Card explicitly returned an ISO error flag (e.g. block out of range) */
-                result = BlockReadCardError;
+                /* ISO15693 error response: flags byte + 1 byte error code (exactly 16 bits) */
+                if(rx_bits == 16 && rx_bytes == 2) {
+                    uint8_t error_code = bit_buffer_get_byte(rx, 1);
+                    if(error_code == 0x10 || error_code == 0x01 || error_code == 0x02) {
+                        result = BlockReadUnsupported;
+                    } else {
+                        FURI_LOG_W(TAG, "Block %u card error code: 0x%02X", block_number, error_code);
+                        result = BlockReadCardError;
+                    }
+                } else {
+                    FURI_LOG_W(TAG, "Block %u malformed error frame (%u bits, %u bytes)",
+                               block_number, (unsigned)rx_bits, (unsigned)rx_bytes);
+                    result = BlockReadCommError;
+                }
                 bit_buffer_free(tx);
                 bit_buffer_free(rx);
                 break;
-            } else if(rx_bytes >= 5) {
-                /* Valid read: 1 flags byte + 4 data bytes */
+            } else if(rx_bits == 40 && rx_bytes == 5) {
+                /* Valid read: exactly 1 flags byte + 4 data bytes (40 bits) */
                 for(size_t i = 0; i < 4; i++) {
                     data[i] = bit_buffer_get_byte(rx, 1 + i);
                 }
@@ -331,6 +345,10 @@ static BlockReadResult read_single_block(
                 bit_buffer_free(tx);
                 bit_buffer_free(rx);
                 break;
+            } else {
+                FURI_LOG_W(TAG, "Block %u unexpected frame size (%u bits, %u bytes)",
+                           block_number, (unsigned)rx_bits, (unsigned)rx_bytes);
+                result = BlockReadCommError;
             }
         }
 
@@ -358,58 +376,66 @@ static Gen3Detection detect_gen3(Iso15693_3Poller* iso) {
     uint8_t data15[4] = {0};
 
     BlockReadResult res14 = read_single_block(iso, ISO15_GEN3_BLOCK_SIG_A, data14);
-    if(res14 == BlockReadCommError) {
-        FURI_LOG_W(TAG, "detect_gen3: comm error reading block 0x14");
+    if(res14 == BlockReadCommError || res14 == BlockReadCardError) {
+        FURI_LOG_W(TAG, "detect_gen3: error reading block 0x14 (res=%d)", (int)res14);
         return GEN3_UNKNOWN;
-    }
-    if(res14 == BlockReadCardError) {
-        FURI_LOG_D(TAG, "detect_gen3: block 0x14 not supported by card (not Gen3)");
-        return GEN3_NO;
     }
 
     furi_delay_ms(15);
 
     BlockReadResult res15 = read_single_block(iso, ISO15_GEN3_BLOCK_SIG_B, data15);
-    if(res15 == BlockReadCommError) {
-        FURI_LOG_W(TAG, "detect_gen3: comm error reading block 0x15");
+    if(res15 == BlockReadCommError || res15 == BlockReadCardError) {
+        FURI_LOG_W(TAG, "detect_gen3: error reading block 0x15 (res=%d)", (int)res15);
         return GEN3_UNKNOWN;
     }
-    if(res15 == BlockReadCardError) {
-        FURI_LOG_D(TAG, "detect_gen3: block 0x15 not supported by card (not Gen3)");
-        return GEN3_NO;
-    }
 
-    FURI_LOG_I(
-        TAG,
-        "detect_gen3: blk14=[%02X %02X %02X %02X] blk15=[%02X %02X %02X %02X]",
-        data14[0], data14[1], data14[2], data14[3],
-        data15[0], data15[1], data15[2], data15[3]);
+    bool sig14_match = (res14 == BlockReadOk && memcmp(data14, gen3_sig14, 4) == 0);
+    bool sig15_match = (res15 == BlockReadOk && memcmp(data15, gen3_sig15, 4) == 0);
 
-    if(memcmp(data14, gen3_sig14, 4) == 0 &&
-       memcmp(data15, gen3_sig15, 4) == 0) {
+    /* 1. Genuine unfinalized Gen3 tag: both signatures match */
+    if(sig14_match && sig15_match) {
+        FURI_LOG_I(TAG, "detect_gen3: both signature blocks match Gen3 magic tag");
         return GEN3_YES;
     }
 
-    /* Blocks 0x14/0x15 are readable but don't match unfinalized Gen3 signature.
-     * Check system info: if tag reports >= 80 blocks, it is a Gen3 tag whose signature
-     * is corrupted or finalized. Fail safely (GEN3_UNKNOWN) rather than treating as Gen2.
-     * If system info query itself fails due to comm/timeout error, also fail safely. */
-    Iso15693_3SystemInfo sys_info;
-    Iso15693_3Error sys_err = iso15693_3_poller_get_system_info(iso, &sys_info);
-    if(sys_err == Iso15693_3ErrorNone) {
-        if((sys_info.flags & ISO15693_3_SYSINFO_FLAG_MEMORY) && sys_info.block_count >= 80) {
-            FURI_LOG_E(
-                TAG,
-                "Suspicious tag: %u blocks reported, but Gen3 signature corrupted/finalized!",
-                sys_info.block_count);
-            return GEN3_UNKNOWN;
-        }
-    } else if(sys_err != Iso15693_3ErrorNotSupported) {
-        FURI_LOG_W(TAG, "detect_gen3: system info query failed (err=%d)", (int)sys_err);
+    /* 2. Partial match: one signature matches but the other does not -> suspicious */
+    if(sig14_match || sig15_match) {
+        FURI_LOG_W(TAG, "detect_gen3: partial Gen3 signature match (blk14=%d, blk15=%d) -> UNKNOWN",
+                   sig14_match, sig15_match);
         return GEN3_UNKNOWN;
     }
 
-    return GEN3_NO;
+    /* 3. If both blocks returned Unsupported (e.g. block not available 0x10),
+     * the tag does not have memory at blocks 0x14/0x15 (standard small memory tag like 8-block SLIX) */
+    if(res14 == BlockReadUnsupported && res15 == BlockReadUnsupported) {
+        FURI_LOG_D(TAG, "detect_gen3: signature blocks unsupported; standard/Gen2 tag");
+        return GEN3_NO;
+    }
+
+    /* 4. Blocks 0x14/0x15 are readable but don't match unfinalized Gen3 signature.
+     * Check system info: if tag reports memory >= 80 blocks, or if system info query fails / is missing memory,
+     * fail safely (GEN3_UNKNOWN) rather than treating as Gen2 to prevent bricking finalized Gen3 tags. */
+    Iso15693_3SystemInfo sys_info;
+    Iso15693_3Error sys_err = iso15693_3_poller_get_system_info(iso, &sys_info);
+    if(sys_err == Iso15693_3ErrorNone) {
+        if((sys_info.flags & ISO15693_3_SYSINFO_FLAG_MEMORY)) {
+            if(sys_info.block_count >= 80) {
+                FURI_LOG_E(
+                    TAG,
+                    "Suspicious tag: %u blocks reported, but Gen3 signature altered/finalized!",
+                    sys_info.block_count);
+                return GEN3_UNKNOWN;
+            }
+            if(sys_info.block_count <= 8) {
+                return GEN3_NO;
+            }
+        }
+        /* Memory flag absent or unexpected block count -> suspicious */
+        return GEN3_UNKNOWN;
+    } else {
+        FURI_LOG_W(TAG, "detect_gen3: system info query failed (err=%d)", (int)sys_err);
+        return GEN3_UNKNOWN;
+    }
 }
 
 /* ============================================================================
@@ -419,7 +445,7 @@ static Gen3Detection detect_gen3(Iso15693_3Poller* iso) {
  *    block 0x11 = uid[3..0]
  * ========================================================================== */
 
-static bool gen3_write_uid(Iso15693_3Poller* iso, const uint8_t uid[8]) {
+static WriteResult gen3_write_uid(Iso15693_3Poller* iso, const uint8_t uid[8]) {
     uint8_t expected_10[4] = {uid[7], uid[6], uid[5], uid[4]};
     uint8_t expected_11[4] = {uid[3], uid[2], uid[1], uid[0]};
 
@@ -443,9 +469,7 @@ static bool gen3_write_uid(Iso15693_3Poller* iso, const uint8_t uid[8]) {
         bool wrote = iso_send_raw(iso, block10, sizeof(block10), ISO15693_FWT_FC);
         furi_delay_ms(20);
 
-        /* Read back block 0x10 to verify.
-         * If it already contains expected bytes, count as success.
-         * Handles magic tags with odd ACK behavior while avoiding unnecessary repeated writes. */
+        /* Read back block 0x10 to verify */
         if(read_single_block(iso, ISO15_GEN3_BLOCK_UID_LOW, readback_10) == BlockReadOk) {
             if(memcmp(readback_10, expected_10, 4) == 0) {
                 block10_ok = true;
@@ -467,7 +491,7 @@ static bool gen3_write_uid(Iso15693_3Poller* iso, const uint8_t uid[8]) {
             "Gen3 UID block 0x10 failed: readback=[%02X %02X %02X %02X], expected=[%02X %02X %02X %02X]",
             readback_10[0], readback_10[1], readback_10[2], readback_10[3],
             expected_10[0], expected_10[1], expected_10[2], expected_10[3]);
-        return false;
+        return WriteResultUidCmdFailed;
     }
 
     furi_delay_ms(20);
@@ -505,44 +529,40 @@ static bool gen3_write_uid(Iso15693_3Poller* iso, const uint8_t uid[8]) {
     if(!block11_ok) {
         FURI_LOG_E(
             TAG,
-            "Gen3 UID block 0x11 failed: readback=[%02X %02X %02X %02X], expected=[%02X %02X %02X %02X]",
+            "Gen3 UID block 0x11 failed (block 0x10 already written!): readback=[%02X %02X %02X %02X], expected=[%02X %02X %02X %02X]",
             readback_11[0], readback_11[1], readback_11[2], readback_11[3],
             expected_11[0], expected_11[1], expected_11[2], expected_11[3]);
-        return false;
+        return WriteResultGen3UidPartial;
     }
 
-    /* Verification inventory: ensure RF UID matches target exactly */
+    /* Verification inventory: ensure canonical RF UID matches target exactly */
     furi_delay_ms(50);
-    uint8_t verify_lsb[8] = {0};
-    bool uid_matched = false;
+    uint8_t actual_uid[8] = {0};
+    bool inventory_received = false;
 
     for(int attempt = 0; attempt < 5; attempt++) {
-        if(iso15693_3_poller_inventory(iso, verify_lsb) == Iso15693_3ErrorNone) {
-            uint8_t verify_msb[8];
-            for(int i = 0; i < 8; i++) {
-                verify_msb[i] = verify_lsb[7 - i];
-            }
-
+        if(iso15693_3_poller_inventory(iso, actual_uid) == Iso15693_3ErrorNone) {
+            inventory_received = true;
             FURI_LOG_I(
                 TAG,
                 "Gen3 Inventory UID: %02X%02X%02X%02X%02X%02X%02X%02X",
-                verify_msb[0], verify_msb[1], verify_msb[2], verify_msb[3],
-                verify_msb[4], verify_msb[5], verify_msb[6], verify_msb[7]);
+                actual_uid[0], actual_uid[1], actual_uid[2], actual_uid[3],
+                actual_uid[4], actual_uid[5], actual_uid[6], actual_uid[7]);
 
-            if(memcmp(verify_msb, uid, 8) == 0) {
-                uid_matched = true;
-                break;
+            if(memcmp(actual_uid, uid, 8) == 0) {
+                return WriteResultOk;
             }
         }
         furi_delay_ms(25);
     }
 
-    if(!uid_matched) {
-        FURI_LOG_E(TAG, "Gen3 inventory verification failed: UID does not match target!");
-        return false;
+    if(!inventory_received) {
+        FURI_LOG_E(TAG, "Gen3 inventory verification failed: card not responding");
+        return WriteResultUidReadbackUnavailable;
     }
 
-    return true;
+    FURI_LOG_E(TAG, "Gen3 inventory verification failed: UID does not match target!");
+    return WriteResultUidMismatch;
 }
 
 /* ============================================================================
@@ -1081,30 +1101,42 @@ static WriteResult do_normal_write(SliWriterApp* app, Iso15693_3Poller* iso) {
     }
     FURI_LOG_I(TAG, "Data blocks verified OK");
 
+    /* If Gen3, confirm signature blocks 0x14/0x15 remain intact after data writes */
+    if(gen3 == GEN3_YES) {
+        furi_delay_ms(20);
+        Gen3Detection verify_sig = detect_gen3(iso);
+        if(verify_sig != GEN3_YES) {
+            FURI_LOG_E(TAG, "Gen3 signature verification failed after block writes!");
+            furi_string_set(app->error_message, "Gen3 sig altered or lost!");
+            return WriteResultBlockVerifyFailed;
+        }
+    }
+
     /* 3. Write target UID if needed */
     static const uint8_t zero_uid[8] = {0};
     if(memcmp(app->nfc_data.uid, zero_uid, 8) != 0 &&
        memcmp(app->nfc_data.uid, app->detected_uid, 8) != 0) {
         furi_delay_ms(30);
-        if(!reset_card_to_ready(iso, NULL)) {
-            FURI_LOG_E(TAG, "Card not responding after data block write");
+        if(!reset_card_to_ready(iso, app->detected_uid)) {
+            FURI_LOG_E(TAG, "Card not responding or UID changed after data block write");
             return WriteResultCardLost;
         }
         furi_delay_ms(20);
 
         if(gen3 == GEN3_YES) {
-            /* Defense-in-depth: confirm Gen3 signature blocks 0x14/0x15 are STILL intact */
-            Gen3Detection verify_sig = detect_gen3(iso);
-            if(verify_sig != GEN3_YES) {
-                FURI_LOG_E(TAG, "Gen3 signature verification failed after block writes!");
-                furi_string_set(app->error_message, "Gen3 sig altered or lost!");
-                return WriteResultBlockVerifyFailed;
-            }
-
             FURI_LOG_I(TAG, "Writing Gen3 target UID...");
-            if(!gen3_write_uid(iso, app->nfc_data.uid)) {
-                furi_string_set(app->error_message, "Gen3 UID write/verify failed");
-                return WriteResultUidCmdFailed;
+            WriteResult res = gen3_write_uid(iso, app->nfc_data.uid);
+            if(res != WriteResultOk) {
+                if(res == WriteResultGen3UidPartial) {
+                    furi_string_set(app->error_message, "Partial UID written!");
+                } else if(res == WriteResultUidMismatch) {
+                    furi_string_set(app->error_message, "UID verify mismatch");
+                } else if(res == WriteResultUidReadbackUnavailable) {
+                    furi_string_set(app->error_message, "Card lost during UID verify");
+                } else {
+                    furi_string_set(app->error_message, "Gen3 UID write failed");
+                }
+                return res;
             }
         } else {
             FURI_LOG_I(TAG, "Writing Gen2 target UID...");
@@ -1242,6 +1274,8 @@ static const char* write_result_get_message(WriteResult result) {
         return "UID verify mismatch";
     case WriteResultSaveUidFailed:
         return "Failed to save UID to SD";
+    case WriteResultGen3UidPartial:
+        return "Partial UID written!";
     default:
         return "Write failed";
     }
