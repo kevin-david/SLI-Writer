@@ -49,6 +49,20 @@ typedef enum {
                                   then set target UID                          */
 } SliWriterMode;
 
+typedef enum {
+    WriteResultOk = 0,
+    WriteResultTagInventoryFailed,
+    WriteResultBlockWriteFailed,
+    WriteResultBlockVerifyFailed,
+    WriteResultCardLost,
+    WriteResultFactoryUidMismatch,
+    WriteResultUidCmdFailed,
+    WriteResultUidReadbackUnavailable,
+    WriteResultUidMismatch,
+    WriteResultSaveUidFailed,
+    WriteResultUnknown,
+} WriteResult;
+
 /* ============================================================================
  *  Scenes / Views / Menu
  * ========================================================================== */
@@ -57,10 +71,13 @@ typedef enum {
     SliWriterSceneStart = 0,
     SliWriterSceneFileSelect,
     SliWriterSceneWrite,
-    SliWriterSceneSuccess,
-    SliWriterSceneError,
+    SliWriterSceneResult,
     SliWriterSceneNum,
 } SliWriterScene;
+
+/* Backward compatibility aliases */
+#define SliWriterSceneSuccess SliWriterSceneResult
+#define SliWriterSceneError   SliWriterSceneResult
 
 typedef enum {
     SliWriterViewSubmenu = 0,
@@ -76,11 +93,11 @@ typedef enum {
 } SliWriterSubmenuIndex;
 
 typedef enum {
-    SliWriterCustomEventWriteSuccess = 100,
-    SliWriterCustomEventWriteError,
-    SliWriterCustomEventParseError,
-    SliWriterCustomEventSaveUidSuccess,
+    SliWriterCustomEventWriteStarted = 100,
+    SliWriterCustomEventWriteDone,
 } SliWriterCustomEvent;
+
+#define SLI_DIALOG_RESULT_OFFSET 200
 
 /* ============================================================================
  *  Parsed .nfc data
@@ -120,14 +137,17 @@ typedef struct {
     bool             nfc_started;
     NfcPoller*       poller;
 
-    /* Write mode — set before starting the poller */
+    /* Write mode & execution state */
     SliWriterMode    write_mode;
+    WriteResult      write_result;
+    bool             is_writing;
 
     /* State */
+    bool             in_about;
     bool             have_uid;
-    uint8_t          detected_uid[8];   /* UID of the card currently in field  */
+    uint8_t          detected_uid[8];   /* UID of card currently in field (canonical MSB-first) */
 
-    /* Special (factory) UID — persisted to SD card */
+    /* Special (factory) UID — persisted to SD card (canonical MSB-first) */
     bool             special_uid_saved;
     uint8_t          special_uid[8];
 

@@ -1,0 +1,4 @@
+Flipper/.vscode/
+Flipper/dist/
+.ufbt/
+*.elf
