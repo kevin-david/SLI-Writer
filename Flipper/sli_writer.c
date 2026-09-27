@@ -754,22 +754,27 @@ static WriteResult write_blocks_addressed(
  *  Persistent special UID storage
  * ========================================================================== */
 
-bool sli_writer_save_special_uid(SliWriterApp* app) {
+bool sli_writer_save_special_uid(SliWriterApp* app, const uint8_t candidate_uid[8]) {
     storage_common_mkdir(app->storage, "/ext/apps_data/sli_writer");
 
     File* f = storage_file_alloc(app->storage);
     bool ok = false;
     if(storage_file_open(f, SLI_SPECIAL_UID_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
-        ok = (storage_file_write(f, app->special_uid, 8) == 8);
+        ok = (storage_file_write(f, candidate_uid, 8) == 8);
         storage_file_close(f);
     }
     storage_file_free(f);
-    if(ok) FURI_LOG_I(TAG, "Special UID saved: %02X%02X%02X%02X%02X%02X%02X%02X",
-                      app->special_uid[0], app->special_uid[1],
-                      app->special_uid[2], app->special_uid[3],
-                      app->special_uid[4], app->special_uid[5],
-                      app->special_uid[6], app->special_uid[7]);
-    else   FURI_LOG_E(TAG, "Special UID save failed");
+    if(ok) {
+        memcpy(app->special_uid, candidate_uid, 8);
+        app->special_uid_saved = true;
+        FURI_LOG_I(TAG, "Special UID saved: %02X%02X%02X%02X%02X%02X%02X%02X",
+                   app->special_uid[0], app->special_uid[1],
+                   app->special_uid[2], app->special_uid[3],
+                   app->special_uid[4], app->special_uid[5],
+                   app->special_uid[6], app->special_uid[7]);
+    } else {
+        FURI_LOG_E(TAG, "Special UID save failed");
+    }
     return ok;
 }
 
@@ -1217,9 +1222,14 @@ static NfcCommand sli_poller_callback(NfcGenericEvent event, void* context) {
     if(iso_event->type != Iso15693_3PollerEventTypeReady)
         return NfcCommandContinue;
 
-    Iso15693_3Poller* iso = event.instance;
-    app->is_writing = true;
+    /* Atomically ensure we don't start writing if scene was cancelled or stopping */
+    if(app->worker_state != SliWriterWorkerStateIdle) {
+        return NfcCommandStop;
+    }
+    app->worker_state = SliWriterWorkerStateWriting;
     view_dispatcher_send_custom_event(app->view_dispatcher, SliWriterCustomEventWriteStarted);
+
+    Iso15693_3Poller* iso = event.instance;
 
     uint8_t inventory_uid[8];
     Iso15693_3Error uid_err = iso15693_3_poller_inventory(iso, inventory_uid);
@@ -1230,7 +1240,6 @@ static NfcCommand sli_poller_callback(NfcGenericEvent event, void* context) {
     }
 
     memcpy(app->detected_uid, inventory_uid, 8);
-    app->have_uid = true;
     FURI_LOG_I(TAG, "Card UID: %02X%02X%02X%02X%02X%02X%02X%02X",
                app->detected_uid[0], app->detected_uid[1],
                app->detected_uid[2], app->detected_uid[3],
@@ -1240,9 +1249,7 @@ static NfcCommand sli_poller_callback(NfcGenericEvent event, void* context) {
 
     switch(app->write_mode) {
     case SliWriterModeSaveUid:
-        memcpy(app->special_uid, app->detected_uid, 8);
-        app->special_uid_saved = true;
-        if(sli_writer_save_special_uid(app)) {
+        if(sli_writer_save_special_uid(app, app->detected_uid)) {
             app->write_result = WriteResultOk;
         } else {
             app->write_result = WriteResultSaveUidFailed;
@@ -1448,13 +1455,10 @@ void sli_writer_scene_write_on_enter(void* context) {
     notification_message(notif, &seq_blink_start);
     furi_record_close(RECORD_NOTIFICATION);
 
-    app->have_uid = false;
-    app->is_writing = false;
+    app->worker_state = SliWriterWorkerStateIdle;
     furi_string_reset(app->error_message);
 
     app->poller = nfc_poller_alloc(app->nfc, NfcProtocolIso15693_3);
-    app->nfc_started = true;
-
     nfc_poller_start(app->poller, sli_poller_callback, app);
     FURI_LOG_I(TAG, "Poller started, mode=%d", (int)app->write_mode);
 }
@@ -1466,9 +1470,10 @@ bool sli_writer_scene_write_on_event(void* context, SceneManagerEvent event) {
        (event.type == SceneManagerEventTypeCustom &&
         event.event == (SLI_DIALOG_RESULT_OFFSET + DialogExResultLeft))) {
         /* Consume Back while write is in progress to prevent UI freeze and partial write */
-        if(app->is_writing) {
+        if(app->worker_state == SliWriterWorkerStateWriting) {
             return true;
         }
+        app->worker_state = SliWriterWorkerStateStopping;
         scene_manager_search_and_switch_to_previous_scene(
             app->scene_manager, SliWriterSceneStart);
         return true;
@@ -1491,12 +1496,11 @@ bool sli_writer_scene_write_on_event(void* context, SceneManagerEvent event) {
 
 void sli_writer_scene_write_on_exit(void* context) {
     SliWriterApp* app = context;
-    app->is_writing = false;
+    app->worker_state = SliWriterWorkerStateStopping;
     if(app->poller) {
         nfc_poller_stop(app->poller);
         nfc_poller_free(app->poller);
-        app->poller      = NULL;
-        app->nfc_started = false;
+        app->poller = NULL;
     }
 }
 
@@ -1604,10 +1608,6 @@ SliWriterApp* sli_writer_app_alloc(void) {
     view_dispatcher_add_view(app->view_dispatcher,
         SliWriterViewDialogEx, dialog_ex_get_view(app->dialog_ex));
 
-    app->loading = loading_alloc();
-    view_dispatcher_add_view(app->view_dispatcher,
-        SliWriterViewLoading, loading_get_view(app->loading));
-
     app->file_path     = furi_string_alloc();
     app->error_message = furi_string_alloc();
 
@@ -1636,11 +1636,9 @@ void sli_writer_app_free(SliWriterApp* app) {
 
     view_dispatcher_remove_view(app->view_dispatcher, SliWriterViewSubmenu);
     view_dispatcher_remove_view(app->view_dispatcher, SliWriterViewDialogEx);
-    view_dispatcher_remove_view(app->view_dispatcher, SliWriterViewLoading);
 
     submenu_free(app->submenu);
     dialog_ex_free(app->dialog_ex);
-    loading_free(app->loading);
 
     view_dispatcher_free(app->view_dispatcher);
     scene_manager_free(app->scene_manager);
