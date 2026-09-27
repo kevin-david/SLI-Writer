@@ -623,7 +623,11 @@ static bool do_normal_write(SliWriterApp* app, Iso15693_3Poller* iso) {
     if(memcmp(app->nfc_data.uid, zero_uid, 8) != 0 &&
        memcmp(app->nfc_data.uid, app->detected_uid, 8) != 0) {
         furi_delay_ms(30);
-        reset_card_to_ready(iso, NULL);
+        if(!reset_card_to_ready(iso, NULL)) {
+            FURI_LOG_E(TAG, "Card not responding after data block write");
+            furi_string_set(app->error_message, "Card lost before UID write");
+            return false;
+        }
         furi_delay_ms(20);
 
         FURI_LOG_I(TAG, "Writing target UID...");
