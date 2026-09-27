@@ -74,15 +74,6 @@
 static const NotificationSequence seq_blink_start = {
     &message_blue_255, &message_delay_50, &message_blue_0, NULL,
 };
-static const NotificationSequence seq_success = {
-    &message_green_255, &message_delay_100, &message_green_0,
-    &message_delay_50,
-    &message_green_255, &message_delay_100, &message_green_0,
-    NULL,
-};
-static const NotificationSequence seq_error = {
-    &message_red_255, &message_delay_100, &message_red_0, NULL,
-};
 
 /* ============================================================================
  *  BitBuffer & Wire-Order Serialization Helpers
@@ -1267,9 +1258,9 @@ static NfcCommand sli_poller_callback(NfcGenericEvent event, void* context) {
 done:;
     NotificationApp* notif = furi_record_open(RECORD_NOTIFICATION);
     if(app->write_result == WriteResultOk) {
-        notification_message(notif, &seq_success);
+        notification_message(notif, &sequence_success);
     } else {
-        notification_message(notif, &seq_error);
+        notification_message(notif, &sequence_error);
     }
     furi_record_close(RECORD_NOTIFICATION);
 
