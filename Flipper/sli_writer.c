@@ -793,8 +793,58 @@ bool sli_writer_load_special_uid(SliWriterApp* app) {
 }
 
 /* ============================================================================
- *  .nfc file parser
+ *  .nfc file parser (line-anchored, field-bounded)
  * ========================================================================== */
+
+static const char* find_line_key(const char* buf, const char* key) {
+    size_t key_len = strlen(key);
+    const char* p = buf;
+    while(p && *p) {
+        if(strncmp(p, key, key_len) == 0) {
+            return p + key_len;
+        }
+        p = strchr(p, '\n');
+        if(p) p++;
+    }
+    return NULL;
+}
+
+static const char* find_line_end(const char* p) {
+    while(*p && *p != '\r' && *p != '\n') {
+        p++;
+    }
+    return p;
+}
+
+static size_t parse_hex_bytes_bounded(
+    const char* start,
+    const char* end,
+    uint8_t* out,
+    size_t max_bytes)
+{
+    size_t count = 0;
+    const char* q = start;
+
+    while(q < end && count < max_bytes) {
+        while(q < end && (*q == ' ' || *q == '\t')) q++;
+        if(q >= end) break;
+
+        char* token_end = NULL;
+        long val = strtol(q, &token_end, 16);
+        if(token_end == q || token_end > end || val < 0 || val > 0xFF) {
+            break;
+        }
+        out[count++] = (uint8_t)val;
+        q = token_end;
+    }
+
+    while(q < end && (*q == ' ' || *q == '\t')) q++;
+    if(q < end) {
+        return 0;
+    }
+
+    return count;
+}
 
 bool sli_writer_parse_nfc_file(SliWriterApp* app, const char* path) {
     File* f = storage_file_alloc(app->storage);
@@ -810,64 +860,50 @@ bool sli_writer_parse_nfc_file(SliWriterApp* app, const char* path) {
             size_t n = storage_file_read(f, buf, sz);
             buf[n] = '\0';
 
-            char* p;
-            size_t uid_count = 0;
+            const char* p;
 
-            if((p = strstr(buf, "UID: "))) {
-                p += 5;
-                char* q = p;
-                for(int i = 0; i < 8; i++) {
-                    while(*q == ' ') q++;
-                    char* end = NULL;
-                    long val = strtol(q, &end, 16);
-                    if(end == q || val < 0 || val > 0xFF) break;
-                    app->nfc_data.uid[i] = (uint8_t)val;
-                    q = end;
-                    uid_count++;
-                }
-            }
-
-            if((p = strstr(buf, "Block Count: "))) {
+            /* 1. Parse Block Count */
+            if((p = find_line_key(buf, "Block Count:"))) {
+                while(*p == ' ' || *p == '\t') p++;
                 char* end = NULL;
-                long val = strtol(p + 13, &end, 0);
-                if(val > 0 && val <= SLI_MAGIC_MAX_BLOCKS) {
+                long val = strtol(p, &end, 10);
+                if(end != p && val > 0 && val <= SLI_MAGIC_MAX_BLOCKS) {
                     app->nfc_data.block_count = (uint8_t)val;
                 }
             }
 
-            if((p = strstr(buf, "Block Size: "))) {
+            /* 2. Parse Block Size */
+            if((p = find_line_key(buf, "Block Size:"))) {
+                while(*p == ' ' || *p == '\t') p++;
                 char* end = NULL;
-                long val = strtol(p + 12, &end, 0);
-                if(val > 0 && val <= 255) {
+                long val = strtol(p, &end, 10);
+                if(end != p && val > 0 && val <= 255) {
                     app->nfc_data.block_size = (uint8_t)val;
                 }
             }
 
+            /* 3. Parse UID (must be exactly 8 bytes on UID line) */
+            size_t uid_count = 0;
+            if((p = find_line_key(buf, "UID:"))) {
+                while(*p == ' ' || *p == '\t') p++;
+                const char* line_end = find_line_end(p);
+                uid_count = parse_hex_bytes_bounded(p, line_end, app->nfc_data.uid, 8);
+            }
+
+            /* 4. Parse Data Content (must be exactly block_count * block_size bytes on line) */
             size_t data_bytes_parsed = 0;
             size_t expected_total = (size_t)app->nfc_data.block_count * app->nfc_data.block_size;
 
             if(expected_total > 0 && expected_total <= sizeof(app->nfc_data.data)) {
-                if((p = strstr(buf, "Data Content: "))) {
-                    p += 14;
-                    char* q2 = p;
-                    for(size_t i = 0; i < expected_total; i++) {
-                        while(*q2 == ' ' || *q2 == '\r' || *q2 == '\n' || *q2 == '\t') q2++;
-                        if(*q2 == '\0') break;
-                        char* end2 = NULL;
-                        long val = strtol(q2, &end2, 16);
-                        if(end2 == q2 || val < 0 || val > 0xFF) break;
-                        app->nfc_data.data[i] = (uint8_t)val;
-                        q2 = end2;
-                        data_bytes_parsed++;
-                    }
+                if((p = find_line_key(buf, "Data Content:"))) {
+                    while(*p == ' ' || *p == '\t') p++;
+                    const char* line_end = find_line_end(p);
+                    data_bytes_parsed = parse_hex_bytes_bounded(
+                        p, line_end, app->nfc_data.data, expected_total);
                 }
             }
 
-            /* Strict validation to prevent partial / zero-filled data from reaching writer:
-             * 1. Exact 8-byte UID
-             * 2. block_count between 1 and SLI_MAGIC_MAX_BLOCKS
-             * 3. block_size == 4
-             * 4. Data Content contains exactly block_count * block_size valid bytes */
+            /* 5. Validate all parsed fields */
             if(uid_count != 8) {
                 furi_string_set(app->error_message, "Invalid UID in .nfc");
                 FURI_LOG_E(TAG, "Parse error: expected 8 UID bytes, found %u", (unsigned)uid_count);
@@ -879,8 +915,8 @@ bool sli_writer_parse_nfc_file(SliWriterApp* app, const char* path) {
                 FURI_LOG_E(TAG, "Parse error: unsupported block size %u", (unsigned)app->nfc_data.block_size);
             } else if(data_bytes_parsed != expected_total) {
                 furi_string_set(app->error_message, "Incomplete data in .nfc file");
-                FURI_LOG_E(TAG, "Parse error: incomplete data %u / %u bytes",
-                           (unsigned)data_bytes_parsed, (unsigned)expected_total);
+                FURI_LOG_E(TAG, "Parse error: expected %u data bytes, found %u",
+                           (unsigned)expected_total, (unsigned)data_bytes_parsed);
             } else {
                 FURI_LOG_I(TAG, "Parsed valid .nfc: blocks=%u size=%u uid=%02X%02X%02X%02X%02X%02X%02X%02X",
                            app->nfc_data.block_count, app->nfc_data.block_size,
@@ -892,6 +928,8 @@ bool sli_writer_parse_nfc_file(SliWriterApp* app, const char* path) {
             }
 
             free(buf);
+        } else {
+            furi_string_set(app->error_message, "Out of memory reading file");
         }
         storage_file_close(f);
     } else {
