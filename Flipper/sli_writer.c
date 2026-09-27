@@ -3,13 +3,18 @@
 //
 // Three write modes:
 //   Normal  — non-addressed write, then UID via 0x40/0x41
-//   SaveUID — inventory only, save detected UID as "special (factory) UID"
+//   SaveUID — inventory only, save detected UID as canonical "special (factory) UID"
 //   Special — restore factory UID, write blocks addressed (flags=0x62), set target UID
 //
 // Special card write sequence:
 //   1. magic_write_uid(factory_uid)  — restore factory UID so blocks are writable
 //   2. write_blocks_addressed()      — flags=0x62 (high rate + addressed + option)
 //   3. magic_write_uid(target_uid)   — set the UID from the .nfc file
+//
+// UID Byte Order:
+//   All UIDs in memory (detected_uid, special_uid, nfc_data.uid) are in canonical MSB-first order,
+//   matching Flipper's iso15693_3_poller_inventory() return value and .nfc file format.
+//   Reversal to wire order (LSB-first) is performed only during raw frame serialization.
 
 #include "sli_writer.h"
 #include <stdlib.h>
@@ -25,10 +30,13 @@
  * ========================================================================== */
 
 #define ISO15693_CMD_WRITE_BLOCK  0x21
+#define ISO15693_CMD_READ_BLOCK   0x20
+#define ISO15693_CMD_SELECT       0x25
+#define ISO15693_CMD_RESET_READY  0x26
 
 /* Gen2 magic UID commands (Proxmark: hf 15 csetuid --v2)
  *   HIGH: 02 E0 09 40 uid[7..4]
- *   LOW:  02 E0 09 41 uid[3..0]  (card stores UID LSB-first) */
+ *   LOW:  02 E0 09 41 uid[3..0] */
 #define SLI_MAGIC_SET_UID_HIGH  0x40
 #define SLI_MAGIC_SET_UID_LOW   0x41
 
@@ -53,8 +61,16 @@ static const NotificationSequence seq_error = {
 };
 
 /* ============================================================================
- *  BitBuffer helpers
+ *  BitBuffer & Wire-Order Serialization Helpers
  * ========================================================================== */
+
+/* All UID arguments and stored values in the application are MSB-first.
+ * ISO15693 over-the-air frames require wire-order (LSB-first) bytes. */
+static void append_uid_wire_order(BitBuffer* tx, const uint8_t uid_msb[8]) {
+    for(size_t i = 0; i < 8; ++i) {
+        bit_buffer_append_byte(tx, uid_msb[7 - i]);
+    }
+}
 
 static BitBuffer* bb_alloc_from(const uint8_t* data, size_t len) {
     BitBuffer* bb = bit_buffer_alloc(len * 8);
@@ -71,10 +87,6 @@ static BitBuffer* bb_alloc_rx(size_t max_bytes) {
     return bb;
 }
 
-/* ============================================================================
- *  Low-level ISO15693 raw frame helper
- * ========================================================================== */
-
 static bool iso_reply_ok(BitBuffer* rx) {
     if(bit_buffer_get_size_bytes(rx) < 1) return false;
     return (bit_buffer_get_byte(rx, 0) & 0x01) == 0;
@@ -89,7 +101,10 @@ static bool iso_send_raw(
     BitBuffer* tx = bb_alloc_from(frame, frame_len);
     if(!tx) return false;
     BitBuffer* rx = bb_alloc_rx(16);
-    if(!rx) { bit_buffer_free(tx); return false; }
+    if(!rx) {
+        bit_buffer_free(tx);
+        return false;
+    }
 
     Iso15693_3Error err = iso15693_3_poller_send_frame(
         iso, tx, rx, fwt_fc ? fwt_fc : ISO15693_FWT_FC);
@@ -111,43 +126,50 @@ static bool iso_send_raw(
 
 /* ============================================================================
  *  Reset card to Ready state helper
- *  Workaround/resync for magic tags to transition from addressed block writes
- *  back to Ready state before vendor UID commands are issued.
- *  If expected_uid_lsb is provided, verifies that the expected card is active.
+ *  Observed device-specific requirement for magic tags to transition from
+ *  addressed block writes back to Ready state before vendor UID commands.
+ *  If expected_uid_msb is provided, verifies that the expected card is active.
  * ========================================================================== */
 
-static bool reset_card_to_ready(Iso15693_3Poller* iso, const uint8_t expected_uid_lsb[8]) {
-    /* 1. Addressed Reset to Ready (0x22 0x26 <UID 8 bytes LSB-first>) */
-    if(expected_uid_lsb) {
-        uint8_t frame_reset[10];
-        frame_reset[0] = 0x22; /* High data rate + Addressed */
-        frame_reset[1] = 0x26; /* ISO15693 RESET_TO_READY */
-        memcpy(&frame_reset[2], expected_uid_lsb, 8);
-        iso_send_raw(iso, frame_reset, sizeof(frame_reset), ISO15693_FWT_FC);
+static bool reset_card_to_ready(Iso15693_3Poller* iso, const uint8_t expected_uid_msb[8]) {
+    /* 1. Addressed Reset to Ready (0x22 0x26 <UID 8 bytes wire order>) */
+    if(expected_uid_msb) {
+        BitBuffer* tx = bit_buffer_alloc(10 * 8);
+        if(tx) {
+            bit_buffer_append_byte(tx, 0x22); /* High data rate + Addressed */
+            bit_buffer_append_byte(tx, ISO15693_CMD_RESET_READY);
+            append_uid_wire_order(tx, expected_uid_msb);
+            BitBuffer* rx = bb_alloc_rx(4);
+            if(rx) {
+                iso15693_3_poller_send_frame(iso, tx, rx, ISO15693_FWT_FC);
+                bit_buffer_free(rx);
+            }
+            bit_buffer_free(tx);
+        }
         furi_delay_ms(20);
     }
 
     /* 2. Non-addressed Reset to Ready (0x02 0x26) */
-    uint8_t frame_non_addressed[2] = {0x02, 0x26};
+    uint8_t frame_non_addressed[2] = {0x02, ISO15693_CMD_RESET_READY};
     iso_send_raw(iso, frame_non_addressed, sizeof(frame_non_addressed), ISO15693_FWT_FC);
     furi_delay_ms(20);
 
     /* 3. Run inventory to ensure card is active in field and in Ready state */
-    uint8_t resync_uid[8];
+    uint8_t resync_uid_msb[8];
     for(int i = 0; i < 5; i++) {
-        if(iso15693_3_poller_inventory(iso, resync_uid) == Iso15693_3ErrorNone) {
-            if(expected_uid_lsb) {
-                if(memcmp(resync_uid, expected_uid_lsb, 8) == 0) {
+        if(iso15693_3_poller_inventory(iso, resync_uid_msb) == Iso15693_3ErrorNone) {
+            if(expected_uid_msb) {
+                if(memcmp(resync_uid_msb, expected_uid_msb, 8) == 0) {
                     FURI_LOG_I(TAG, "Card reset to ready and verified UID: %02X%02X%02X%02X%02X%02X%02X%02X",
-                               resync_uid[7], resync_uid[6], resync_uid[5], resync_uid[4],
-                               resync_uid[3], resync_uid[2], resync_uid[1], resync_uid[0]);
+                               resync_uid_msb[0], resync_uid_msb[1], resync_uid_msb[2], resync_uid_msb[3],
+                               resync_uid_msb[4], resync_uid_msb[5], resync_uid_msb[6], resync_uid_msb[7]);
                     return true;
                 }
                 FURI_LOG_W(TAG, "Card reset to ready: UID mismatch, retrying resync...");
             } else {
                 FURI_LOG_I(TAG, "Card reset to ready, UID: %02X%02X%02X%02X%02X%02X%02X%02X",
-                           resync_uid[7], resync_uid[6], resync_uid[5], resync_uid[4],
-                           resync_uid[3], resync_uid[2], resync_uid[1], resync_uid[0]);
+                           resync_uid_msb[0], resync_uid_msb[1], resync_uid_msb[2], resync_uid_msb[3],
+                           resync_uid_msb[4], resync_uid_msb[5], resync_uid_msb[6], resync_uid_msb[7]);
                 return true;
             }
         }
@@ -161,13 +183,13 @@ static bool reset_card_to_ready(Iso15693_3Poller* iso, const uint8_t expected_ui
  *  Magic UID write (non-addressed, used for both Normal and Special modes)
  * ========================================================================== */
 
-static bool magic_write_uid(Iso15693_3Poller* iso, const uint8_t uid_msb[8]) {
-    /* HIGH: bytes uid[0..3] sent in reverse (card stores LSB-first) */
+static WriteResult magic_write_uid(Iso15693_3Poller* iso, const uint8_t uid_msb[8]) {
+    /* HIGH: sets bytes 4..7 in MSB / bytes 0..3 on wire */
     uint8_t frame_high[8] = {
         0x02, 0xE0, 0x09, SLI_MAGIC_SET_UID_HIGH,
         uid_msb[7], uid_msb[6], uid_msb[5], uid_msb[4],
     };
-    /* LOW: bytes uid[4..7] sent in reverse */
+    /* LOW: sets bytes 0..3 in MSB / bytes 4..7 on wire */
     uint8_t frame_low[8] = {
         0x02, 0xE0, 0x09, SLI_MAGIC_SET_UID_LOW,
         uid_msb[3], uid_msb[2], uid_msb[1], uid_msb[0],
@@ -182,17 +204,8 @@ static bool magic_write_uid(Iso15693_3Poller* iso, const uint8_t uid_msb[8]) {
             break;
         }
         furi_delay_ms(25);
-        /* Check if write took effect despite timeout/ACK failure */
-        uint8_t check_uid[8];
-        if(iso15693_3_poller_inventory(iso, check_uid) == Iso15693_3ErrorNone) {
-            if(memcmp(&check_uid[0], &frame_high[4], 4) == 0) {
-                FURI_LOG_I(TAG, "SET_UID_HIGH verified via inventory despite no ACK");
-                ok_high = true;
-                break;
-            }
-        }
     }
-    if(!ok_high) { FURI_LOG_E(TAG, "SET_UID_HIGH failed"); return false; }
+
     furi_delay_ms(50);
 
     FURI_LOG_I(TAG, "magic_write_uid LOW:  %02X%02X%02X%02X",
@@ -204,50 +217,46 @@ static bool magic_write_uid(Iso15693_3Poller* iso, const uint8_t uid_msb[8]) {
             break;
         }
         furi_delay_ms(25);
-        /* Check if write took effect despite timeout/ACK failure */
-        uint8_t check_uid[8];
-        if(iso15693_3_poller_inventory(iso, check_uid) == Iso15693_3ErrorNone) {
-            if(memcmp(&check_uid[4], &frame_low[4], 4) == 0) {
-                FURI_LOG_I(TAG, "SET_UID_LOW verified via inventory despite no ACK");
-                ok_low = true;
-                break;
-            }
-        }
     }
-    if(!ok_low) { FURI_LOG_E(TAG, "SET_UID_LOW failed"); return false; }
 
-    /* Strict verification inventory */
+    /* Verification inventory: fail-closed readback */
     furi_delay_ms(50);
-    uint8_t verify_lsb[8];
-    bool verified = false;
+    uint8_t actual_uid_msb[8];
+    bool readback_received = false;
 
-    for(int i = 0; i < 5; i++) {
-        if(iso15693_3_poller_inventory(iso, verify_lsb) == Iso15693_3ErrorNone) {
-            uint8_t verify_msb[8];
-            for(int j = 0; j < 8; j++) {
-                verify_msb[j] = verify_lsb[7 - j];
-            }
-
-            if(memcmp(verify_msb, uid_msb, 8) == 0) {
+    for(unsigned attempt = 0; attempt < 5; ++attempt) {
+        Iso15693_3Error err = iso15693_3_poller_inventory(iso, actual_uid_msb);
+        if(err == Iso15693_3ErrorNone) {
+            readback_received = true;
+            if(memcmp(actual_uid_msb, uid_msb, sizeof(actual_uid_msb)) == 0) {
                 FURI_LOG_I(TAG, "Post-write UID verified: %02X%02X%02X%02X%02X%02X%02X%02X",
-                           verify_msb[0], verify_msb[1], verify_msb[2], verify_msb[3],
-                           verify_msb[4], verify_msb[5], verify_msb[6], verify_msb[7]);
-                verified = true;
-                break;
+                           actual_uid_msb[0], actual_uid_msb[1], actual_uid_msb[2], actual_uid_msb[3],
+                           actual_uid_msb[4], actual_uid_msb[5], actual_uid_msb[6], actual_uid_msb[7]);
+                return WriteResultOk;
             }
-
-            FURI_LOG_W(TAG, "UID mismatch after write: got %02X%02X%02X%02X%02X%02X%02X%02X",
-                       verify_msb[0], verify_msb[1], verify_msb[2], verify_msb[3],
-                       verify_msb[4], verify_msb[5], verify_msb[6], verify_msb[7]);
+            FURI_LOG_W(TAG, "UID mismatch: got %02X%02X%02X%02X%02X%02X%02X%02X expected %02X%02X%02X%02X%02X%02X%02X%02X",
+                       actual_uid_msb[0], actual_uid_msb[1], actual_uid_msb[2], actual_uid_msb[3],
+                       actual_uid_msb[4], actual_uid_msb[5], actual_uid_msb[6], actual_uid_msb[7],
+                       uid_msb[0], uid_msb[1], uid_msb[2], uid_msb[3],
+                       uid_msb[4], uid_msb[5], uid_msb[6], uid_msb[7]);
         }
-        furi_delay_ms(25);
+        if(attempt + 1 < 5) {
+            furi_delay_ms(25);
+        }
     }
 
-    if(!verified) {
-        FURI_LOG_E(TAG, "magic_write_uid verification failed: target UID not verified");
+    if(!ok_high || !ok_low) {
+        FURI_LOG_E(TAG, "SET_UID command failed (high=%d, low=%d)", ok_high, ok_low);
+        return WriteResultUidCmdFailed;
     }
 
-    return verified;
+    if(!readback_received) {
+        FURI_LOG_E(TAG, "UID readback unavailable");
+        return WriteResultUidReadbackUnavailable;
+    }
+
+    FURI_LOG_E(TAG, "UID verification failed: UID mismatch");
+    return WriteResultUidMismatch;
 }
 
 /* ============================================================================
@@ -255,18 +264,20 @@ static bool magic_write_uid(Iso15693_3Poller* iso, const uint8_t uid_msb[8]) {
  * ========================================================================== */
 
 static void select_card(Iso15693_3Poller* iso, const uint8_t uid_msb[8]) {
-    uint8_t frame[10];
-    frame[0] = 0x22;  /* high rate + addressed */
-    frame[1] = 0x25;  /* SELECT */
-    for(int i = 0; i < 8; i++) frame[2 + i] = uid_msb[7 - i]; /* LSB-first */
+    BitBuffer* tx = bit_buffer_alloc(10 * 8);
+    if(!tx) return;
+    bit_buffer_append_byte(tx, 0x22);  /* high rate + addressed */
+    bit_buffer_append_byte(tx, ISO15693_CMD_SELECT);
+    append_uid_wire_order(tx, uid_msb);
 
-    BitBuffer* tx = bb_alloc_from(frame, sizeof(frame));
     BitBuffer* rx = bb_alloc_rx(4);
-    Iso15693_3Error err = iso15693_3_poller_send_frame(iso, tx, rx, ISO15693_FWT_FC);
-    FURI_LOG_I(TAG, "SELECT resp: err=%d rxbytes=%u",
-               (int)err, (unsigned)bit_buffer_get_size_bytes(rx));
+    if(rx) {
+        Iso15693_3Error err = iso15693_3_poller_send_frame(iso, tx, rx, ISO15693_FWT_FC);
+        FURI_LOG_I(TAG, "SELECT resp: err=%d rxbytes=%u",
+                   (int)err, (unsigned)bit_buffer_get_size_bytes(rx));
+        bit_buffer_free(rx);
+    }
     bit_buffer_free(tx);
-    bit_buffer_free(rx);
 }
 
 /* ============================================================================
@@ -279,8 +290,7 @@ static bool write_blocks(
     uint8_t block_count,
     uint8_t block_size)
 {
-    if(block_size == 0) block_size = 4;
-    if(block_size > 4)  block_size = 4;
+    if(block_size == 0 || block_size > 4) block_size = 4;
     size_t blocks = (block_count > SLI_MAGIC_MAX_BLOCKS) ? SLI_MAGIC_MAX_BLOCKS : block_count;
 
     FURI_LOG_I(TAG, "write_blocks: %u blocks x %u bytes (non-addressed)", (unsigned)blocks, (unsigned)block_size);
@@ -311,31 +321,22 @@ static bool write_blocks(
 }
 
 /* ============================================================================
- *  Special block write (addressed + option, flags=0x62)
- *  flags=0x62: high data rate(0x02) + addressed(0x20) + option(0x40)
- *
- *  With Option flag, NXP cards use 2-phase response — timeout is normal.
- *  We ignore no-response errors and only fail on explicit card error flag.
- * ========================================================================== */
-
-/* ============================================================================
  *  Special block read helper (addressed, flags=0x22)
  * ========================================================================== */
 
 static bool read_block_addressed(
     Iso15693_3Poller* iso,
-    const uint8_t uid_lsb[8],
+    const uint8_t uid_msb[8],
     uint8_t block_number,
     uint8_t data[4])
 {
-    uint8_t frame[11];
-    frame[0] = 0x22; /* High data rate + Addressed */
-    frame[1] = 0x20; /* ISO15693 READ_SINGLE_BLOCK */
-    memcpy(&frame[2], uid_lsb, 8);
-    frame[10] = block_number;
-
-    BitBuffer* tx = bb_alloc_from(frame, sizeof(frame));
+    BitBuffer* tx = bit_buffer_alloc(11 * 8);
     if(!tx) return false;
+    bit_buffer_append_byte(tx, 0x22); /* High data rate + Addressed */
+    bit_buffer_append_byte(tx, ISO15693_CMD_READ_BLOCK);
+    append_uid_wire_order(tx, uid_msb);
+    bit_buffer_append_byte(tx, block_number);
+
     BitBuffer* rx = bb_alloc_rx(16);
     if(!rx) {
         bit_buffer_free(tx);
@@ -362,41 +363,39 @@ static bool read_block_addressed(
 /* ============================================================================
  *  Special block write (addressed + option, flags=0x62)
  *  flags=0x62: high data rate(0x02) + addressed(0x20) + option(0x40)
- *
- *  With Option flag, NXP cards use 2-phase response — timeout is normal.
- *  After writing all blocks, every block is read back and strictly verified
- *  byte-for-byte against source data before proceeding.
  * ========================================================================== */
 
 static bool write_blocks_addressed(
     Iso15693_3Poller* iso,
-    const uint8_t uid_lsb[8],
+    const uint8_t uid_msb[8],
     const uint8_t* data,
     uint8_t block_count,
     uint8_t block_size)
 {
-    if(block_size == 0) block_size = 4;
-    if(block_size > 4)  block_size = 4;
+    if(block_size == 0 || block_size > 4) block_size = 4;
     size_t blocks = (block_count > SLI_MAGIC_MAX_BLOCKS) ? SLI_MAGIC_MAX_BLOCKS : block_count;
 
     FURI_LOG_I(TAG, "write_blocks_addressed: %u blocks (flags=0x62)", (unsigned)blocks);
 
     for(size_t b = 0; b < blocks; b++) {
-        uint8_t wframe[15];
-        wframe[0]  = 0x62;
-        wframe[1]  = ISO15693_CMD_WRITE_BLOCK;
-        for(int i = 0; i < 8; i++) wframe[2 + i] = uid_lsb[i];
-        wframe[10] = (uint8_t)b;
-        memcpy(&wframe[11], &data[b * block_size], block_size);
-        if(block_size < 4) memset(&wframe[11 + block_size], 0x00, 4 - block_size);
+        BitBuffer* tx = bit_buffer_alloc(15 * 8);
+        if(!tx) return false;
+        bit_buffer_append_byte(tx, 0x62);
+        bit_buffer_append_byte(tx, ISO15693_CMD_WRITE_BLOCK);
+        append_uid_wire_order(tx, uid_msb);
+        bit_buffer_append_byte(tx, (uint8_t)b);
+        bit_buffer_append_bytes(tx, &data[b * block_size], block_size);
+        if(block_size < 4) {
+            for(size_t pad = 0; pad < (size_t)(4 - block_size); pad++) {
+                bit_buffer_append_byte(tx, 0x00);
+            }
+        }
 
-        if(b == 0) FURI_LOG_I(TAG, "  frame[0]: %02X %02X %02X%02X%02X%02X%02X%02X%02X%02X %02X",
-            wframe[0], wframe[1],
-            wframe[2],wframe[3],wframe[4],wframe[5],
-            wframe[6],wframe[7],wframe[8],wframe[9], wframe[10]);
-
-        BitBuffer* tx = bb_alloc_from(wframe, sizeof(wframe));
         BitBuffer* rx = bb_alloc_rx(16);
+        if(!rx) {
+            bit_buffer_free(tx);
+            return false;
+        }
 
         /* Extended FWT for Option flag (2-phase response) */
         Iso15693_3Error err = iso15693_3_poller_send_frame(iso, tx, rx, 2000000);
@@ -407,7 +406,7 @@ static bool write_blocks_addressed(
             FURI_LOG_I(TAG, "  resp=[%02X %02X]",
                        bit_buffer_get_byte(rx, 0), bit_buffer_get_byte(rx, 1));
 
-        /* Only fail on explicit card error response (bit0=1 in flags byte) */
+        /* Fail on explicit card error response (bit0=1 in flags byte) */
         bool card_error = (rxsz >= 1) && ((bit_buffer_get_byte(rx, 0) & 0x01) != 0);
 
         bit_buffer_free(tx);
@@ -430,7 +429,7 @@ static bool write_blocks_addressed(
         bool verified_block = false;
 
         for(int attempt = 0; attempt < 5; attempt++) {
-            if(read_block_addressed(iso, uid_lsb, (uint8_t)b, readback)) {
+            if(read_block_addressed(iso, uid_msb, (uint8_t)b, readback)) {
                 if(memcmp(readback, &data[b * block_size], block_size) == 0) {
                     verified_block = true;
                     break;
@@ -440,10 +439,7 @@ static bool write_blocks_addressed(
                     "Block %u readback mismatch (attempt %d): [%02X %02X %02X %02X] != [%02X %02X %02X %02X]",
                     (unsigned)b,
                     attempt,
-                    readback[0],
-                    readback[1],
-                    readback[2],
-                    readback[3],
+                    readback[0], readback[1], readback[2], readback[3],
                     data[b * block_size],
                     data[b * block_size + 1],
                     data[b * block_size + 2],
@@ -467,7 +463,6 @@ static bool write_blocks_addressed(
  * ========================================================================== */
 
 bool sli_writer_save_special_uid(SliWriterApp* app) {
-    /* Create directory if needed */
     storage_common_mkdir(app->storage, "/ext/apps_data/sli_writer");
 
     File* f = storage_file_alloc(app->storage);
@@ -567,12 +562,6 @@ bool sli_writer_parse_nfc_file(SliWriterApp* app, const char* path) {
                     }
                 }
 
-                /* Validation:
-                 * - Exact 8-byte UID
-                 * - block_count > 0 and <= SLI_MAGIC_MAX_BLOCKS
-                 * - block_size == 4
-                 * - Data Content contains exactly block_count * block_size valid bytes
-                 */
                 if(uid_count == 8 &&
                    app->nfc_data.block_count > 0 &&
                    app->nfc_data.block_count <= SLI_MAGIC_MAX_BLOCKS &&
@@ -607,15 +596,14 @@ bool sli_writer_parse_nfc_file(SliWriterApp* app, const char* path) {
  * ========================================================================== */
 
 /* Normal write: SELECT -> write blocks (non-addressed) -> write UID */
-static bool do_normal_write(SliWriterApp* app, Iso15693_3Poller* iso) {
+static WriteResult do_normal_write(SliWriterApp* app, Iso15693_3Poller* iso) {
     select_card(iso, app->detected_uid);
     furi_delay_ms(10);
 
     FURI_LOG_I(TAG, "Normal write: %u blocks", app->nfc_data.block_count);
     if(!write_blocks(iso, app->nfc_data.data,
                      app->nfc_data.block_count, app->nfc_data.block_size)) {
-        furi_string_set(app->error_message, "Block write failed");
-        return false;
+        return WriteResultBlockWriteFailed;
     }
     FURI_LOG_I(TAG, "Blocks OK");
 
@@ -625,75 +613,63 @@ static bool do_normal_write(SliWriterApp* app, Iso15693_3Poller* iso) {
         furi_delay_ms(30);
         if(!reset_card_to_ready(iso, NULL)) {
             FURI_LOG_E(TAG, "Card not responding after data block write");
-            furi_string_set(app->error_message, "Card lost before UID write");
-            return false;
+            return WriteResultCardLost;
         }
         furi_delay_ms(20);
 
         FURI_LOG_I(TAG, "Writing target UID...");
-        if(!magic_write_uid(iso, app->nfc_data.uid)) {
-            furi_string_set(app->error_message, "UID write failed");
-            return false;
+        WriteResult res = magic_write_uid(iso, app->nfc_data.uid);
+        if(res != WriteResultOk) {
+            return res;
         }
         FURI_LOG_I(TAG, "UID OK");
     } else {
         FURI_LOG_I(TAG, "UID skip (same or zero)");
     }
-    return true;
+    return WriteResultOk;
 }
 
 /* Special write:
  *   1. Restore factory UID (so blocks become writable)
  *   2. Write blocks addressed (flags=0x62) using factory UID
  *   3. Set target UID from .nfc file */
-static bool do_special_write(SliWriterApp* app, Iso15693_3Poller* iso) {
-    FURI_LOG_I(TAG, "Special write: factory=%02X%02X target=%02X%02X",
-               app->special_uid[7], app->special_uid[6],
+static WriteResult do_special_write(SliWriterApp* app, Iso15693_3Poller* iso) {
+    FURI_LOG_I(TAG, "Special write: factory=%02X%02X.. target=%02X%02X..",
+               app->special_uid[0], app->special_uid[1],
                app->nfc_data.uid[0], app->nfc_data.uid[1]);
 
-    /* Step 1: restore factory UID (skip if card already has factory UID)
-     * special_uid stored LSB-first — reverse to MSB-first for magic_write_uid */
-    uint8_t factory_uid_msb[8];
-    for(int i = 0; i < 8; i++) factory_uid_msb[i] = app->special_uid[7 - i];
-
-    /* detected_uid is MSB-first, factory_uid_msb is also MSB-first — compare directly */
-    bool already_factory = (memcmp(app->detected_uid, factory_uid_msb, 8) == 0);
+    /* Step 1: restore factory UID (skip if card already has factory UID) */
+    bool already_factory = (memcmp(app->detected_uid, app->special_uid, 8) == 0);
     if(already_factory) {
         FURI_LOG_I(TAG, "Step 1: skip (card already has factory UID)");
     } else {
-        FURI_LOG_I(TAG, "Step 1: restore factory UID (MSB: %02X%02X%02X%02X%02X%02X%02X%02X)",
-                   factory_uid_msb[0], factory_uid_msb[1], factory_uid_msb[2], factory_uid_msb[3],
-                   factory_uid_msb[4], factory_uid_msb[5], factory_uid_msb[6], factory_uid_msb[7]);
-        if(!magic_write_uid(iso, factory_uid_msb)) {
-            furi_string_set(app->error_message, "Restore factory UID failed");
-            return false;
+        FURI_LOG_I(TAG, "Step 1: restore factory UID");
+        WriteResult res = magic_write_uid(iso, app->special_uid);
+        if(res != WriteResultOk) {
+            return res;
         }
         furi_delay_ms(50);
-    } /* let card settle after UID change */
+    }
 
-    /* Require inventoried UID == factory_uid_msb before allowing any block writes */
+    /* Require inventoried UID == factory UID before allowing any block writes */
     furi_delay_ms(50);
     uint8_t uid_resync[8];
     bool factory_uid_verified = false;
     for(int i = 0; i < 5; i++) {
         if(iso15693_3_poller_inventory(iso, uid_resync) == Iso15693_3ErrorNone) {
-            uint8_t uid_resync_msb[8];
-            for(int j = 0; j < 8; j++) uid_resync_msb[j] = uid_resync[7 - j];
-
-            if(memcmp(uid_resync_msb, factory_uid_msb, 8) == 0) {
+            if(memcmp(uid_resync, app->special_uid, 8) == 0) {
                 factory_uid_verified = true;
                 break;
             }
             FURI_LOG_W(TAG, "Factory UID mismatch in resync: expected %02X.. got %02X..",
-                       factory_uid_msb[0], uid_resync_msb[0]);
+                       app->special_uid[0], uid_resync[0]);
         }
         furi_delay_ms(25);
     }
 
     if(!factory_uid_verified) {
         FURI_LOG_E(TAG, "Card does not have factory UID active; aborting Special write");
-        furi_string_set(app->error_message, "Factory UID mismatch");
-        return false;
+        return WriteResultFactoryUidMismatch;
     }
 
     /* Step 2: write blocks addressed using factory UID */
@@ -702,41 +678,81 @@ static bool do_special_write(SliWriterApp* app, Iso15693_3Poller* iso) {
                                app->nfc_data.data,
                                app->nfc_data.block_count,
                                app->nfc_data.block_size)) {
-        furi_string_set(app->error_message, "Block write failed (special)");
-        return false;
+        return WriteResultBlockWriteFailed;
     }
     FURI_LOG_I(TAG, "Blocks OK");
 
     /* Wait for card EEPROM write to settle after block writes */
     furi_delay_ms(100);
 
-    /* Resynchronize card to Ready state before vendor UID commands */
+    /* Observed device-specific requirement: reset card to Ready state before vendor UID commands */
     FURI_LOG_I(TAG, "Resynchronizing card to ready state before UID write...");
     if(!reset_card_to_ready(iso, app->special_uid)) {
         FURI_LOG_E(TAG, "Card not responding or UID mismatch after block write");
-        furi_string_set(app->error_message, "Card lost before UID write");
-        return false;
+        return WriteResultCardLost;
     }
     furi_delay_ms(30);
 
     /* Step 3: set target UID */
     static const uint8_t zero_uid[8] = {0};
     if(memcmp(app->nfc_data.uid, zero_uid, 8) != 0 &&
-       memcmp(app->nfc_data.uid, factory_uid_msb, 8) != 0) {
-        FURI_LOG_I(TAG, "Step 3: write target UID (MSB: %02X%02X%02X%02X%02X%02X%02X%02X)",
-                   app->nfc_data.uid[0], app->nfc_data.uid[1],
-                   app->nfc_data.uid[2], app->nfc_data.uid[3],
-                   app->nfc_data.uid[4], app->nfc_data.uid[5],
-                   app->nfc_data.uid[6], app->nfc_data.uid[7]);
-        if(!magic_write_uid(iso, app->nfc_data.uid)) {
-            furi_string_set(app->error_message, "Target UID write failed");
-            return false;
+       memcmp(app->nfc_data.uid, app->special_uid, 8) != 0) {
+        FURI_LOG_I(TAG, "Step 3: write target UID");
+        WriteResult res = magic_write_uid(iso, app->nfc_data.uid);
+        if(res != WriteResultOk) {
+            return res;
         }
         FURI_LOG_I(TAG, "Target UID OK");
     } else {
         FURI_LOG_I(TAG, "Step 3: UID skip (same as factory or zero)");
     }
-    return true;
+    return WriteResultOk;
+}
+
+static const char* write_result_get_message(WriteResult result) {
+    switch(result) {
+    case WriteResultOk:
+        return "Success";
+    case WriteResultTagInventoryFailed:
+        return "Card inventory failed";
+    case WriteResultBlockWriteFailed:
+        return "Block write failed";
+    case WriteResultBlockVerifyFailed:
+        return "Block verification failed";
+    case WriteResultCardLost:
+        return "Card lost during write";
+    case WriteResultFactoryUidMismatch:
+        return "Factory UID mismatch";
+    case WriteResultUidCmdFailed:
+        return "UID write command failed";
+    case WriteResultUidReadbackUnavailable:
+        return "Card lost during UID verify";
+    case WriteResultUidMismatch:
+        return "UID verify mismatch";
+    case WriteResultSaveUidFailed:
+        return "Failed to save UID to SD";
+    default:
+        return "Write failed";
+    }
+}
+
+/* ============================================================================
+ *  UI Helpers
+ * ========================================================================== */
+
+static void prepare_dialog(SliWriterApp* app) {
+    dialog_ex_reset(app->dialog_ex);
+    dialog_ex_set_context(app->dialog_ex, app);
+    dialog_ex_set_result_callback(app->dialog_ex, sli_writer_dialog_ex_callback);
+}
+
+static void show_message(SliWriterApp* app, const char* title, const char* message) {
+    prepare_dialog(app);
+    dialog_ex_set_header(app->dialog_ex, title, 64, 0, AlignCenter, AlignTop);
+    dialog_ex_set_text(app->dialog_ex, message, 64, 32, AlignCenter, AlignCenter);
+    dialog_ex_set_left_button_text(app->dialog_ex, "Back");
+    dialog_ex_set_center_button_text(app->dialog_ex, "OK");
+    view_dispatcher_switch_to_view(app->view_dispatcher, SliWriterViewDialogEx);
 }
 
 /* ============================================================================
@@ -754,17 +770,18 @@ static NfcCommand sli_poller_callback(NfcGenericEvent event, void* context) {
         return NfcCommandContinue;
 
     Iso15693_3Poller* iso = event.instance;
-    bool success = false;
+    app->is_writing = true;
+    view_dispatcher_send_custom_event(app->view_dispatcher, SliWriterCustomEventWriteStarted);
 
-    uint8_t uid_lsb[8];
-    Iso15693_3Error uid_err = iso15693_3_poller_inventory(iso, uid_lsb);
+    uint8_t inventory_uid[8];
+    Iso15693_3Error uid_err = iso15693_3_poller_inventory(iso, inventory_uid);
     if(uid_err != Iso15693_3ErrorNone) {
         FURI_LOG_E(TAG, "Inventory failed: err=%d", (int)uid_err);
-        furi_string_set(app->error_message, "Card inventory failed");
+        app->write_result = WriteResultTagInventoryFailed;
         goto done;
     }
 
-    for(int i = 0; i < 8; i++) app->detected_uid[i] = uid_lsb[7 - i];
+    memcpy(app->detected_uid, inventory_uid, 8);
     app->have_uid = true;
     FURI_LOG_I(TAG, "Card UID: %02X%02X%02X%02X%02X%02X%02X%02X",
                app->detected_uid[0], app->detected_uid[1],
@@ -775,34 +792,33 @@ static NfcCommand sli_poller_callback(NfcGenericEvent event, void* context) {
 
     switch(app->write_mode) {
     case SliWriterModeSaveUid:
-        for(int i = 0; i < 8; i++) app->special_uid[i] = app->detected_uid[7 - i];
+        memcpy(app->special_uid, app->detected_uid, 8);
         app->special_uid_saved = true;
-        success = sli_writer_save_special_uid(app);
-        if(!success) furi_string_set(app->error_message, "Save UID failed");
+        if(sli_writer_save_special_uid(app)) {
+            app->write_result = WriteResultOk;
+        } else {
+            app->write_result = WriteResultSaveUidFailed;
+        }
         break;
     case SliWriterModeSpecial:
-        success = do_special_write(app, iso);
+        app->write_result = do_special_write(app, iso);
         break;
     case SliWriterModeNormal:
     default:
-        success = do_normal_write(app, iso);
+        app->write_result = do_normal_write(app, iso);
         break;
     }
 
 done:;
     NotificationApp* notif = furi_record_open(RECORD_NOTIFICATION);
-    if(success) {
+    if(app->write_result == WriteResultOk) {
         notification_message(notif, &seq_success);
     } else {
         notification_message(notif, &seq_error);
     }
     furi_record_close(RECORD_NOTIFICATION);
 
-    uint32_t evt = success ? SliWriterCustomEventWriteSuccess : SliWriterCustomEventWriteError;
-    if(app->write_mode == SliWriterModeSaveUid && success)
-        evt = SliWriterCustomEventSaveUidSuccess;
-    view_dispatcher_send_custom_event(app->view_dispatcher, evt);
-
+    view_dispatcher_send_custom_event(app->view_dispatcher, SliWriterCustomEventWriteDone);
     return NfcCommandStop;
 }
 
@@ -858,7 +874,6 @@ void sli_writer_scene_start_on_enter(void* context) {
         submenu_add_item(app->submenu, uid_info, 99, sli_writer_submenu_callback, app);
     }
 
-    /* "Write Special" label — no UID shown here, it's on the line above */
     submenu_add_item(
         app->submenu,
         app->special_uid_saved ? "Write Special" : "Write Special (no UID saved)",
@@ -906,9 +921,10 @@ bool sli_writer_scene_start_on_event(void* context, SceneManagerEvent event) {
 
     if(event.event == SliWriterSubmenuIndexWriteSpec) {
         if(!app->special_uid_saved) {
+            app->write_result = WriteResultUnknown;
             furi_string_set(app->error_message,
                 "No special UID saved!\nUse 'Save Special UID' first.");
-            scene_manager_next_scene(app->scene_manager, SliWriterSceneError);
+            scene_manager_next_scene(app->scene_manager, SliWriterSceneResult);
             return true;
         }
         app->write_mode = SliWriterModeSpecial;
@@ -918,14 +934,8 @@ bool sli_writer_scene_start_on_event(void* context, SceneManagerEvent event) {
 
     if(event.event == SliWriterSubmenuIndexAbout) {
         app->in_about = true;
-        dialog_ex_reset(app->dialog_ex);
-        dialog_ex_set_header(app->dialog_ex, "SLI Writer", 64, 0, AlignCenter, AlignTop);
-        dialog_ex_set_text(app->dialog_ex,
-            "ISO15693 magic card writer\nSLI / SLIX-L / Special",
-            64, 32, AlignCenter, AlignCenter);
-        dialog_ex_set_left_button_text(app->dialog_ex, "Back");
-        dialog_ex_set_center_button_text(app->dialog_ex, "OK");
-        view_dispatcher_switch_to_view(app->view_dispatcher, SliWriterViewDialogEx);
+        show_message(app, "SLI Writer",
+            "ISO15693 magic card writer\nSLI / SLIX-L / Special");
         return true;
     }
     return false;
@@ -949,8 +959,9 @@ void sli_writer_scene_file_select_on_enter(void* context) {
         if(sli_writer_parse_nfc_file(app, furi_string_get_cstr(app->file_path))) {
             scene_manager_next_scene(app->scene_manager, SliWriterSceneWrite);
         } else {
+            app->write_result = WriteResultUnknown;
             furi_string_set(app->error_message, "Cannot parse .nfc file");
-            scene_manager_next_scene(app->scene_manager, SliWriterSceneError);
+            scene_manager_next_scene(app->scene_manager, SliWriterSceneResult);
         }
     } else {
         scene_manager_previous_scene(app->scene_manager);
@@ -970,7 +981,7 @@ void sli_writer_scene_file_select_on_exit(void* context) {
 void sli_writer_scene_write_on_enter(void* context) {
     SliWriterApp* app = context;
 
-    dialog_ex_reset(app->dialog_ex);
+    prepare_dialog(app);
     dialog_ex_set_header(app->dialog_ex, "SLI Writer", 64, 0, AlignCenter, AlignTop);
 
     if(app->write_mode == SliWriterModeSaveUid) {
@@ -988,6 +999,7 @@ void sli_writer_scene_write_on_enter(void* context) {
     furi_record_close(RECORD_NOTIFICATION);
 
     app->have_uid = false;
+    app->is_writing = false;
     furi_string_reset(app->error_message);
 
     app->poller = nfc_poller_alloc(app->nfc, NfcProtocolIso15693_3);
@@ -1002,21 +1014,25 @@ bool sli_writer_scene_write_on_event(void* context, SceneManagerEvent event) {
 
     if(event.type == SceneManagerEventTypeBack ||
        (event.type == SceneManagerEventTypeCustom &&
-        (event.event == (SLI_DIALOG_RESULT_OFFSET + DialogExResultLeft) ||
-         event.event == (SLI_DIALOG_RESULT_OFFSET + DialogExResultCenter)))) {
-        scene_manager_search_and_switch_to_another_scene(
+        event.event == (SLI_DIALOG_RESULT_OFFSET + DialogExResultLeft))) {
+        /* Consume Back while write is in progress to prevent UI freeze and partial write */
+        if(app->is_writing) {
+            return true;
+        }
+        scene_manager_search_and_switch_to_previous_scene(
             app->scene_manager, SliWriterSceneStart);
         return true;
     }
 
     if(event.type == SceneManagerEventTypeCustom) {
-        if(event.event == SliWriterCustomEventWriteSuccess ||
-           event.event == SliWriterCustomEventSaveUidSuccess) {
-            scene_manager_next_scene(app->scene_manager, SliWriterSceneSuccess);
+        if(event.event == SliWriterCustomEventWriteStarted) {
+            dialog_ex_set_text(app->dialog_ex, "Writing...\nDo not remove tag",
+                               64, 32, AlignCenter, AlignCenter);
+            dialog_ex_set_left_button_text(app->dialog_ex, NULL);
             return true;
         }
-        if(event.event == SliWriterCustomEventWriteError) {
-            scene_manager_next_scene(app->scene_manager, SliWriterSceneError);
+        if(event.event == SliWriterCustomEventWriteDone) {
+            scene_manager_next_scene(app->scene_manager, SliWriterSceneResult);
             return true;
         }
     }
@@ -1025,6 +1041,7 @@ bool sli_writer_scene_write_on_event(void* context, SceneManagerEvent event) {
 
 void sli_writer_scene_write_on_exit(void* context) {
     SliWriterApp* app = context;
+    app->is_writing = false;
     if(app->poller) {
         nfc_poller_stop(app->poller);
         nfc_poller_free(app->poller);
@@ -1033,69 +1050,42 @@ void sli_writer_scene_write_on_exit(void* context) {
     }
 }
 
-/* --- Success --- */
-void sli_writer_scene_success_on_enter(void* context) {
+/* --- Result (combines Success and Error scenes) --- */
+void sli_writer_scene_result_on_enter(void* context) {
     SliWriterApp* app = context;
-    dialog_ex_reset(app->dialog_ex);
-    dialog_ex_set_header(app->dialog_ex, "Success!", 64, 0, AlignCenter, AlignTop);
 
-    if(app->write_mode == SliWriterModeSaveUid) {
-        char msg[64];
-        snprintf(msg, sizeof(msg), "UID saved:\n%02X %02X %02X %02X\n%02X %02X %02X %02X",
-                 app->special_uid[0], app->special_uid[1],
-                 app->special_uid[2], app->special_uid[3],
-                 app->special_uid[4], app->special_uid[5],
-                 app->special_uid[6], app->special_uid[7]);
-        dialog_ex_set_text(app->dialog_ex, msg, 64, 32, AlignCenter, AlignCenter);
+    if(app->write_result == WriteResultOk) {
+        if(app->write_mode == SliWriterModeSaveUid) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "UID saved:\n%02X %02X %02X %02X\n%02X %02X %02X %02X",
+                     app->special_uid[0], app->special_uid[1],
+                     app->special_uid[2], app->special_uid[3],
+                     app->special_uid[4], app->special_uid[5],
+                     app->special_uid[6], app->special_uid[7]);
+            show_message(app, "Success!", msg);
+        } else {
+            show_message(app, "Success!", "Card written successfully");
+        }
     } else {
-        dialog_ex_set_text(app->dialog_ex, "Card written successfully",
-                           64, 32, AlignCenter, AlignCenter);
+        const char* msg = (furi_string_size(app->error_message) > 0) ?
+            furi_string_get_cstr(app->error_message) :
+            write_result_get_message(app->write_result);
+        show_message(app, "Error", msg);
     }
-    dialog_ex_set_center_button_text(app->dialog_ex, "OK");
-    dialog_ex_set_left_button_text(app->dialog_ex, "Back");
-    view_dispatcher_switch_to_view(app->view_dispatcher, SliWriterViewDialogEx);
 }
 
-bool sli_writer_scene_success_on_event(void* context, SceneManagerEvent event) {
+bool sli_writer_scene_result_on_event(void* context, SceneManagerEvent event) {
     SliWriterApp* app = context;
     if(event.type == SceneManagerEventTypeBack ||
        (event.type == SceneManagerEventTypeCustom && event.event >= SLI_DIALOG_RESULT_OFFSET)) {
-        scene_manager_search_and_switch_to_another_scene(
+        scene_manager_search_and_switch_to_previous_scene(
             app->scene_manager, SliWriterSceneStart);
         return true;
     }
     return false;
 }
 
-void sli_writer_scene_success_on_exit(void* context) {
-    SliWriterApp* app = context;
-    dialog_ex_reset(app->dialog_ex);
-}
-
-/* --- Error --- */
-void sli_writer_scene_error_on_enter(void* context) {
-    SliWriterApp* app = context;
-    dialog_ex_reset(app->dialog_ex);
-    dialog_ex_set_header(app->dialog_ex, "Error", 64, 0, AlignCenter, AlignTop);
-    dialog_ex_set_text(app->dialog_ex, furi_string_get_cstr(app->error_message),
-                       64, 32, AlignCenter, AlignCenter);
-    dialog_ex_set_center_button_text(app->dialog_ex, "OK");
-    dialog_ex_set_left_button_text(app->dialog_ex, "Back");
-    view_dispatcher_switch_to_view(app->view_dispatcher, SliWriterViewDialogEx);
-}
-
-bool sli_writer_scene_error_on_event(void* context, SceneManagerEvent event) {
-    SliWriterApp* app = context;
-    if(event.type == SceneManagerEventTypeBack ||
-       (event.type == SceneManagerEventTypeCustom && event.event >= SLI_DIALOG_RESULT_OFFSET)) {
-        scene_manager_search_and_switch_to_another_scene(
-            app->scene_manager, SliWriterSceneStart);
-        return true;
-    }
-    return false;
-}
-
-void sli_writer_scene_error_on_exit(void* context) {
+void sli_writer_scene_result_on_exit(void* context) {
     SliWriterApp* app = context;
     dialog_ex_reset(app->dialog_ex);
 }
@@ -1108,24 +1098,21 @@ static void (*const sli_scene_on_enter[])(void*) = {
     sli_writer_scene_start_on_enter,
     sli_writer_scene_file_select_on_enter,
     sli_writer_scene_write_on_enter,
-    sli_writer_scene_success_on_enter,
-    sli_writer_scene_error_on_enter,
+    sli_writer_scene_result_on_enter,
 };
 
 static bool (*const sli_scene_on_event[])(void*, SceneManagerEvent) = {
     sli_writer_scene_start_on_event,
     sli_writer_scene_file_select_on_event,
     sli_writer_scene_write_on_event,
-    sli_writer_scene_success_on_event,
-    sli_writer_scene_error_on_event,
+    sli_writer_scene_result_on_event,
 };
 
 static void (*const sli_scene_on_exit[])(void*) = {
     sli_writer_scene_start_on_exit,
     sli_writer_scene_file_select_on_exit,
     sli_writer_scene_write_on_exit,
-    sli_writer_scene_success_on_exit,
-    sli_writer_scene_error_on_exit,
+    sli_writer_scene_result_on_exit,
 };
 
 static const SceneManagerHandlers sli_scene_handlers = {
