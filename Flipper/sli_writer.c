@@ -390,6 +390,20 @@ static Gen3Detection detect_gen3(Iso15693_3Poller* iso) {
         return GEN3_YES;
     }
 
+    /* Blocks 0x14/0x15 are readable but don't match unfinalized Gen3 signature.
+     * Check system info: if tag reports >= 80 blocks, it is a Gen3 tag whose signature
+     * is corrupted or finalized. Fail safely (GEN3_UNKNOWN) rather than treating as Gen2. */
+    Iso15693_3SystemInfo sys_info;
+    if(iso15693_3_poller_get_system_info(iso, &sys_info) == Iso15693_3ErrorNone) {
+        if((sys_info.flags & ISO15693_3_SYSINFO_FLAG_MEMORY) && sys_info.block_count >= 80) {
+            FURI_LOG_E(
+                TAG,
+                "Suspicious tag: %u blocks reported, but Gen3 signature corrupted/finalized!",
+                sys_info.block_count);
+            return GEN3_UNKNOWN;
+        }
+    }
+
     return GEN3_NO;
 }
 
@@ -1019,6 +1033,40 @@ static WriteResult do_normal_write(SliWriterApp* app, Iso15693_3Poller* iso) {
         return b_res;
     }
     FURI_LOG_I(TAG, "Blocks OK");
+
+    /* Verify all written data blocks byte-for-byte */
+    FURI_LOG_I(TAG, "Verifying %u written blocks...", (unsigned)blocks_to_write);
+    furi_delay_ms(20);
+
+    for(uint8_t b = 0; b < blocks_to_write; b++) {
+        uint8_t readback[4] = {0};
+        bool verified = false;
+
+        for(int attempt = 0; attempt < 5; attempt++) {
+            if(read_single_block(iso, b, readback) == BlockReadOk) {
+                if(memcmp(readback, &app->nfc_data.data[b * app->nfc_data.block_size], app->nfc_data.block_size) == 0) {
+                    verified = true;
+                    break;
+                }
+                FURI_LOG_W(
+                    TAG,
+                    "Block %u readback mismatch (attempt %d): [%02X %02X %02X %02X] != [%02X %02X %02X %02X]",
+                    (unsigned)b,
+                    attempt,
+                    readback[0], readback[1], readback[2], readback[3],
+                    app->nfc_data.data[b * 4], app->nfc_data.data[b * 4 + 1],
+                    app->nfc_data.data[b * 4 + 2], app->nfc_data.data[b * 4 + 3]);
+            }
+            furi_delay_ms(20);
+        }
+
+        if(!verified) {
+            FURI_LOG_E(TAG, "Data verify failed on block %u", (unsigned)b);
+            furi_string_set(app->error_message, "Data verify failed");
+            return false;
+        }
+    }
+    FURI_LOG_I(TAG, "Data blocks verified OK");
 
     /* 3. Write target UID if needed */
     static const uint8_t zero_uid[8] = {0};
