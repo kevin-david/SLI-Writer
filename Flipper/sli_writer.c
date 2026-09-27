@@ -67,13 +67,6 @@
 #define SLI_BLOCK_READ_RETRIES     2
 #define SLI_EEPROM_WRITE_DELAY_MS  20
 
-/* ============================================================================
- *  LED notification sequences
- * ========================================================================== */
-
-static const NotificationSequence seq_blink_start = {
-    &message_blue_255, &message_delay_50, &message_blue_0, NULL,
-};
 
 /* ============================================================================
  *  BitBuffer & Wire-Order Serialization Helpers
@@ -1256,14 +1249,6 @@ static NfcCommand sli_poller_callback(NfcGenericEvent event, void* context) {
     }
 
 done:;
-    NotificationApp* notif = furi_record_open(RECORD_NOTIFICATION);
-    if(app->write_result == WriteResultOk) {
-        notification_message(notif, &sequence_success);
-    } else {
-        notification_message(notif, &sequence_error);
-    }
-    furi_record_close(RECORD_NOTIFICATION);
-
     view_dispatcher_send_custom_event(app->view_dispatcher, SliWriterCustomEventWriteDone);
     return NfcCommandStop;
 }
@@ -1442,9 +1427,7 @@ void sli_writer_scene_write_on_enter(void* context) {
     dialog_ex_set_left_button_text(app->dialog_ex, "Back");
     view_dispatcher_switch_to_view(app->view_dispatcher, SliWriterViewDialogEx);
 
-    NotificationApp* notif = furi_record_open(RECORD_NOTIFICATION);
-    notification_message(notif, &seq_blink_start);
-    furi_record_close(RECORD_NOTIFICATION);
+    notification_message(app->notifications, &sequence_blink_start_cyan);
 
     app->worker_state = SliWriterWorkerStateIdle;
     furi_string_reset(app->error_message);
@@ -1478,6 +1461,12 @@ bool sli_writer_scene_write_on_event(void* context, SceneManagerEvent event) {
             return true;
         }
         if(event.event == SliWriterCustomEventWriteDone) {
+            notification_message(app->notifications, &sequence_blink_stop);
+            if(app->write_result == WriteResultOk) {
+                notification_message(app->notifications, &sequence_success);
+            } else {
+                notification_message(app->notifications, &sequence_error);
+            }
             scene_manager_next_scene(app->scene_manager, SliWriterSceneResult);
             return true;
         }
@@ -1488,6 +1477,7 @@ bool sli_writer_scene_write_on_event(void* context, SceneManagerEvent event) {
 void sli_writer_scene_write_on_exit(void* context) {
     SliWriterApp* app = context;
     app->worker_state = SliWriterWorkerStateStopping;
+    notification_message(app->notifications, &sequence_blink_stop);
     if(app->poller) {
         nfc_poller_stop(app->poller);
         nfc_poller_free(app->poller);
@@ -1500,6 +1490,7 @@ void sli_writer_scene_result_on_enter(void* context) {
     SliWriterApp* app = context;
 
     if(app->write_result == WriteResultOk) {
+        notification_message_block(app->notifications, &sequence_set_green_255);
         if(app->write_mode == SliWriterModeSaveUid) {
             char msg[64];
             snprintf(msg, sizeof(msg), "UID saved:\n%02X %02X %02X %02X\n%02X %02X %02X %02X",
@@ -1532,6 +1523,7 @@ bool sli_writer_scene_result_on_event(void* context, SceneManagerEvent event) {
 
 void sli_writer_scene_result_on_exit(void* context) {
     SliWriterApp* app = context;
+    notification_message_block(app->notifications, &sequence_reset_green);
     dialog_ex_reset(app->dialog_ex);
 }
 
@@ -1576,9 +1568,10 @@ SliWriterApp* sli_writer_app_alloc(void) {
     furi_check(app);
     memset(app, 0x00, sizeof(SliWriterApp));
 
-    app->gui     = furi_record_open(RECORD_GUI);
-    app->storage = furi_record_open(RECORD_STORAGE);
-    app->dialogs = furi_record_open(RECORD_DIALOGS);
+    app->gui           = furi_record_open(RECORD_GUI);
+    app->storage       = furi_record_open(RECORD_STORAGE);
+    app->dialogs       = furi_record_open(RECORD_DIALOGS);
+    app->notifications = furi_record_open(RECORD_NOTIFICATION);
 
     app->nfc = nfc_alloc();
 
@@ -1640,6 +1633,7 @@ void sli_writer_app_free(SliWriterApp* app) {
     furi_record_close(RECORD_GUI);
     furi_record_close(RECORD_STORAGE);
     furi_record_close(RECORD_DIALOGS);
+    furi_record_close(RECORD_NOTIFICATION);
 
     free(app);
 }

@@ -20,6 +20,8 @@
 
 #include <dialogs/dialogs.h>
 #include <storage/storage.h>
+#include <notification/notification.h>
+#include <notification/notification_messages.h>
 #include <toolbox/bit_buffer.h>
 
 #include <stdbool.h>
@@ -128,9 +130,10 @@ typedef struct {
     Submenu*         submenu;
     DialogEx*        dialog_ex;
 
-    /* FS & dialogs */
+    /* FS, notifications & dialogs */
     Storage*         storage;
     DialogsApp*      dialogs;
+    NotificationApp* notifications;
 
     /* Strings */
     FuriString*      file_path;
