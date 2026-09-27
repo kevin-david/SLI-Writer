@@ -60,7 +60,12 @@
 #define ISO15_GEN3_BLOCK_SIG_B     0x15
 
 /* FWT in carrier cycles — 500000 fc ≈ 37ms */
-#define ISO15693_FWT_FC  500000
+#define ISO15693_FWT_FC            500000
+
+/* Retry and timing constants */
+#define SLI_BLOCK_WRITE_RETRIES    5
+#define SLI_BLOCK_READ_RETRIES     2
+#define SLI_EEPROM_WRITE_DELAY_MS  20
 
 /* ============================================================================
  *  LED notification sequences
@@ -92,7 +97,7 @@ static void append_uid_wire_order(BitBuffer* tx, const uint8_t uid_msb[8]) {
 }
 
 static BitBuffer* bb_alloc_from(const uint8_t* data, size_t len) {
-    BitBuffer* bb = bit_buffer_alloc(len * 8);
+    BitBuffer* bb = bit_buffer_alloc(len);
     if(!bb) return NULL;
     bit_buffer_reset(bb);
     if(data && len) bit_buffer_append_bytes(bb, data, len);
@@ -100,7 +105,7 @@ static BitBuffer* bb_alloc_from(const uint8_t* data, size_t len) {
 }
 
 static BitBuffer* bb_alloc_rx(size_t max_bytes) {
-    BitBuffer* bb = bit_buffer_alloc(max_bytes * 8);
+    BitBuffer* bb = bit_buffer_alloc(max_bytes);
     if(!bb) return NULL;
     bit_buffer_set_size(bb, 0);
     return bb;
@@ -153,7 +158,7 @@ static bool iso_send_raw(
 static bool reset_card_to_ready(Iso15693_3Poller* iso, const uint8_t expected_uid_msb[8]) {
     /* 1. Addressed Reset to Ready (0x22 0x26 <UID 8 bytes wire order>) */
     if(expected_uid_msb) {
-        BitBuffer* tx = bit_buffer_alloc(10 * 8);
+        BitBuffer* tx = bit_buffer_alloc(10);
         if(tx) {
             bit_buffer_append_byte(tx, 0x22); /* High data rate + Addressed */
             bit_buffer_append_byte(tx, ISO15693_CMD_RESET_READY);
@@ -297,15 +302,27 @@ typedef enum {
 
 static BlockReadResult read_single_block(
     Iso15693_3Poller* iso,
+    const uint8_t uid_msb[8],
     uint8_t block_number,
     uint8_t data[4])
 {
     BlockReadResult result = BlockReadCommError;
 
-    for(int attempt = 0; attempt < 3; attempt++) {
-        uint8_t frame[3] = {0x02, ISO15693_CMD_READ_BLOCK, block_number};
-        BitBuffer* tx = bb_alloc_from(frame, sizeof(frame));
-        if(!tx) return BlockReadCommError;
+    for(int attempt = 0; attempt < SLI_BLOCK_READ_RETRIES; attempt++) {
+        BitBuffer* tx = NULL;
+        if(uid_msb) {
+            tx = bit_buffer_alloc(11);
+            if(!tx) return BlockReadCommError;
+            bit_buffer_append_byte(tx, 0x22); /* High data rate + Addressed */
+            bit_buffer_append_byte(tx, ISO15693_CMD_READ_BLOCK);
+            append_uid_wire_order(tx, uid_msb);
+            bit_buffer_append_byte(tx, block_number);
+        } else {
+            uint8_t frame[3] = {0x02, ISO15693_CMD_READ_BLOCK, block_number};
+            tx = bb_alloc_from(frame, sizeof(frame));
+            if(!tx) return BlockReadCommError;
+        }
+
         BitBuffer* rx = bb_alloc_rx(16);
         if(!rx) {
             bit_buffer_free(tx);
@@ -355,7 +372,9 @@ static BlockReadResult read_single_block(
         bit_buffer_free(tx);
         bit_buffer_free(rx);
         result = BlockReadCommError;
-        furi_delay_ms(15);
+        if(attempt + 1 < SLI_BLOCK_READ_RETRIES) {
+            furi_delay_ms(15);
+        }
     }
 
     return result;
@@ -375,7 +394,7 @@ static Gen3Detection detect_gen3(Iso15693_3Poller* iso) {
     uint8_t data14[4] = {0};
     uint8_t data15[4] = {0};
 
-    BlockReadResult res14 = read_single_block(iso, ISO15_GEN3_BLOCK_SIG_A, data14);
+    BlockReadResult res14 = read_single_block(iso, NULL, ISO15_GEN3_BLOCK_SIG_A, data14);
     if(res14 == BlockReadCommError || res14 == BlockReadCardError) {
         FURI_LOG_W(TAG, "detect_gen3: error reading block 0x14 (res=%d)", (int)res14);
         return GEN3_UNKNOWN;
@@ -383,7 +402,7 @@ static Gen3Detection detect_gen3(Iso15693_3Poller* iso) {
 
     furi_delay_ms(15);
 
-    BlockReadResult res15 = read_single_block(iso, ISO15_GEN3_BLOCK_SIG_B, data15);
+    BlockReadResult res15 = read_single_block(iso, NULL, ISO15_GEN3_BLOCK_SIG_B, data15);
     if(res15 == BlockReadCommError || res15 == BlockReadCardError) {
         FURI_LOG_W(TAG, "detect_gen3: error reading block 0x15 (res=%d)", (int)res15);
         return GEN3_UNKNOWN;
@@ -438,6 +457,37 @@ static Gen3Detection detect_gen3(Iso15693_3Poller* iso) {
     }
 }
 
+/* Helper to write and verify a single block with bounded retry budget */
+static bool write_single_block_verified(
+    Iso15693_3Poller* iso,
+    uint8_t block_number,
+    const uint8_t data[4],
+    uint8_t readback_out[4])
+{
+    uint8_t wframe[7] = {
+        0x02,
+        ISO15693_CMD_WRITE_BLOCK,
+        block_number,
+        data[0], data[1], data[2], data[3],
+    };
+
+    for(int attempt = 0; attempt < SLI_BLOCK_WRITE_RETRIES; attempt++) {
+        iso_send_raw(iso, wframe, sizeof(wframe), ISO15693_FWT_FC);
+        furi_delay_ms(SLI_EEPROM_WRITE_DELAY_MS);
+
+        if(read_single_block(iso, NULL, block_number, readback_out) == BlockReadOk) {
+            if(memcmp(readback_out, data, 4) == 0) {
+                return true;
+            }
+        }
+        if(attempt + 1 < SLI_BLOCK_WRITE_RETRIES) {
+            furi_delay_ms(15);
+        }
+    }
+
+    return false;
+}
+
 /* ============================================================================
  *  Gen3 magic UID write helper with read-back verification
  *  Gen3 stores writable UID across blocks 0x10 and 0x11:
@@ -446,8 +496,8 @@ static Gen3Detection detect_gen3(Iso15693_3Poller* iso) {
  * ========================================================================== */
 
 static WriteResult gen3_write_uid(Iso15693_3Poller* iso, const uint8_t uid[8]) {
-    uint8_t expected_10[4] = {uid[7], uid[6], uid[5], uid[4]};
-    uint8_t expected_11[4] = {uid[3], uid[2], uid[1], uid[0]};
+    const uint8_t expected_10[4] = {uid[7], uid[6], uid[5], uid[4]};
+    const uint8_t expected_11[4] = {uid[3], uid[2], uid[1], uid[0]};
 
     FURI_LOG_I(
         TAG,
@@ -455,87 +505,32 @@ static WriteResult gen3_write_uid(Iso15693_3Poller* iso, const uint8_t uid[8]) {
         uid[0], uid[1], uid[2], uid[3],
         uid[4], uid[5], uid[6], uid[7]);
 
-    /* Write block 0x10 */
-    uint8_t block10[7] = {
-        0x02,
-        ISO15693_CMD_WRITE_BLOCK,
-        ISO15_GEN3_BLOCK_UID_LOW,
-        expected_10[0], expected_10[1], expected_10[2], expected_10[3],
-    };
+    uint8_t readback[4] = {0};
 
-    uint8_t readback_10[4] = {0};
-    bool block10_ok = false;
-    for(int attempt = 0; attempt < 5; attempt++) {
-        bool wrote = iso_send_raw(iso, block10, sizeof(block10), ISO15693_FWT_FC);
-        furi_delay_ms(20);
-
-        /* Read back block 0x10 to verify */
-        if(read_single_block(iso, ISO15_GEN3_BLOCK_UID_LOW, readback_10) == BlockReadOk) {
-            if(memcmp(readback_10, expected_10, 4) == 0) {
-                block10_ok = true;
-                break;
-            }
-        } else if(wrote) {
-            furi_delay_ms(20);
-            if(read_single_block(iso, ISO15_GEN3_BLOCK_UID_LOW, readback_10) == BlockReadOk &&
-               memcmp(readback_10, expected_10, 4) == 0) {
-                block10_ok = true;
-                break;
-            }
-        }
-    }
-
-    if(!block10_ok) {
+    /* 1. Write and verify block 0x10 */
+    if(!write_single_block_verified(iso, ISO15_GEN3_BLOCK_UID_LOW, expected_10, readback)) {
         FURI_LOG_E(
             TAG,
             "Gen3 UID block 0x10 failed: readback=[%02X %02X %02X %02X], expected=[%02X %02X %02X %02X]",
-            readback_10[0], readback_10[1], readback_10[2], readback_10[3],
+            readback[0], readback[1], readback[2], readback[3],
             expected_10[0], expected_10[1], expected_10[2], expected_10[3]);
         return WriteResultUidCmdFailed;
     }
 
-    furi_delay_ms(20);
+    furi_delay_ms(SLI_EEPROM_WRITE_DELAY_MS);
 
-    /* Write block 0x11 */
-    uint8_t block11[7] = {
-        0x02,
-        ISO15693_CMD_WRITE_BLOCK,
-        ISO15_GEN3_BLOCK_UID_HIGH,
-        expected_11[0], expected_11[1], expected_11[2], expected_11[3],
-    };
-
-    uint8_t readback_11[4] = {0};
-    bool block11_ok = false;
-    for(int attempt = 0; attempt < 5; attempt++) {
-        bool wrote = iso_send_raw(iso, block11, sizeof(block11), ISO15693_FWT_FC);
-        furi_delay_ms(20);
-
-        /* Read back block 0x11 to verify */
-        if(read_single_block(iso, ISO15_GEN3_BLOCK_UID_HIGH, readback_11) == BlockReadOk) {
-            if(memcmp(readback_11, expected_11, 4) == 0) {
-                block11_ok = true;
-                break;
-            }
-        } else if(wrote) {
-            furi_delay_ms(20);
-            if(read_single_block(iso, ISO15_GEN3_BLOCK_UID_HIGH, readback_11) == BlockReadOk &&
-               memcmp(readback_11, expected_11, 4) == 0) {
-                block11_ok = true;
-                break;
-            }
-        }
-    }
-
-    if(!block11_ok) {
+    /* 2. Write and verify block 0x11 */
+    memset(readback, 0, sizeof(readback));
+    if(!write_single_block_verified(iso, ISO15_GEN3_BLOCK_UID_HIGH, expected_11, readback)) {
         FURI_LOG_E(
             TAG,
             "Gen3 UID block 0x11 failed (block 0x10 already written!): readback=[%02X %02X %02X %02X], expected=[%02X %02X %02X %02X]",
-            readback_11[0], readback_11[1], readback_11[2], readback_11[3],
+            readback[0], readback[1], readback[2], readback[3],
             expected_11[0], expected_11[1], expected_11[2], expected_11[3]);
         return WriteResultGen3UidPartial;
     }
 
-    /* Verification inventory: ensure canonical RF UID matches target exactly */
+    /* 3. Verification inventory: ensure canonical RF UID matches target exactly */
     furi_delay_ms(50);
     uint8_t actual_uid[8] = {0};
     bool inventory_received = false;
@@ -553,7 +548,9 @@ static WriteResult gen3_write_uid(Iso15693_3Poller* iso, const uint8_t uid[8]) {
                 return WriteResultOk;
             }
         }
-        furi_delay_ms(25);
+        if(attempt + 1 < 5) {
+            furi_delay_ms(25);
+        }
     }
 
     if(!inventory_received) {
@@ -570,7 +567,7 @@ static WriteResult gen3_write_uid(Iso15693_3Poller* iso, const uint8_t uid[8]) {
  * ========================================================================== */
 
 static void select_card(Iso15693_3Poller* iso, const uint8_t uid_msb[8]) {
-    BitBuffer* tx = bit_buffer_alloc(10 * 8);
+    BitBuffer* tx = bit_buffer_alloc(10);
     if(!tx) return;
     bit_buffer_append_byte(tx, 0x22);  /* high rate + addressed */
     bit_buffer_append_byte(tx, ISO15693_CMD_SELECT);
@@ -587,38 +584,53 @@ static void select_card(Iso15693_3Poller* iso, const uint8_t uid_msb[8]) {
 }
 
 /* ============================================================================
- *  Normal block read helper (non-addressed, flags=0x02)
+ *  Block verification helper (reads back and verifies data blocks)
  * ========================================================================== */
 
-static bool read_block(Iso15693_3Poller* iso, uint8_t block_number, uint8_t data[4]) {
-    uint8_t frame[3];
-    frame[0] = 0x02; /* High data rate */
-    frame[1] = ISO15693_CMD_READ_BLOCK;
-    frame[2] = block_number;
+static WriteResult verify_blocks(
+    Iso15693_3Poller* iso,
+    const uint8_t uid_msb[8],
+    const uint8_t* data,
+    size_t blocks,
+    uint8_t block_size)
+{
+    FURI_LOG_I(TAG, "Verifying %u written blocks...", (unsigned)blocks);
+    furi_delay_ms(30);
 
-    BitBuffer* tx = bb_alloc_from(frame, sizeof(frame));
-    if(!tx) return false;
-    BitBuffer* rx = bb_alloc_rx(16);
-    if(!rx) {
-        bit_buffer_free(tx);
-        return false;
-    }
+    for(size_t b = 0; b < blocks; b++) {
+        uint8_t readback[4] = {0};
+        bool verified_block = false;
 
-    Iso15693_3Error err = iso15693_3_poller_send_frame(iso, tx, rx, ISO15693_FWT_FC);
-    bool ok = (err == Iso15693_3ErrorNone) && iso_reply_ok(rx);
-    size_t rxsz = bit_buffer_get_size_bytes(rx);
-
-    if(ok && rxsz >= 5) {
-        for(size_t i = 0; i < 4; i++) {
-            data[i] = bit_buffer_get_byte(rx, 1 + i);
+        for(int attempt = 0; attempt < SLI_BLOCK_WRITE_RETRIES; attempt++) {
+            if(read_single_block(iso, uid_msb, (uint8_t)b, readback) == BlockReadOk) {
+                if(memcmp(readback, &data[b * block_size], block_size) == 0) {
+                    verified_block = true;
+                    break;
+                }
+                FURI_LOG_W(
+                    TAG,
+                    "Block %u readback mismatch (attempt %d): [%02X %02X %02X %02X] != [%02X %02X %02X %02X]",
+                    (unsigned)b,
+                    attempt,
+                    readback[0], readback[1], readback[2], readback[3],
+                    data[b * block_size],
+                    data[b * block_size + 1],
+                    data[b * block_size + 2],
+                    data[b * block_size + 3]);
+            }
+            if(attempt + 1 < SLI_BLOCK_WRITE_RETRIES) {
+                furi_delay_ms(SLI_EEPROM_WRITE_DELAY_MS);
+            }
         }
-    } else {
-        ok = false;
+
+        if(!verified_block) {
+            FURI_LOG_E(TAG, "Block %u readback verification failed!", (unsigned)b);
+            return WriteResultBlockVerifyFailed;
+        }
     }
 
-    bit_buffer_free(tx);
-    bit_buffer_free(rx);
-    return ok;
+    FURI_LOG_I(TAG, "All %u blocks verified successfully!", (unsigned)blocks);
+    return WriteResultOk;
 }
 
 /* ============================================================================
@@ -645,13 +657,13 @@ static WriteResult write_blocks(
         if(block_size < 4) memset(&wframe[3 + block_size], 0x00, 4 - block_size);
 
         bool wrote = false;
-        for(int attempt = 0; attempt < 5 && !wrote; attempt++) {
+        for(int attempt = 0; attempt < SLI_BLOCK_WRITE_RETRIES && !wrote; attempt++) {
             wrote = iso_send_raw(iso, wframe, sizeof(wframe), ISO15693_FWT_FC);
             if(!wrote) {
-                furi_delay_ms(20);
+                furi_delay_ms(SLI_EEPROM_WRITE_DELAY_MS);
                 /* Check if EEPROM burn succeeded despite dropped response ACK */
                 uint8_t current[4] = {0};
-                if(read_single_block(iso, (uint8_t)b, current) == BlockReadOk &&
+                if(read_single_block(iso, NULL, (uint8_t)b, current) == BlockReadOk &&
                    memcmp(current, &wframe[3], 4) == 0) {
                     FURI_LOG_I(TAG, "Block %u: verified via read-back despite missing ACK", (unsigned)b);
                     wrote = true;
@@ -667,85 +679,11 @@ static WriteResult write_blocks(
             FURI_LOG_E(TAG, "write_blocks: block %u failed", (unsigned)b);
             return WriteResultBlockWriteFailed;
         }
-        furi_delay_ms(20);
+        furi_delay_ms(SLI_EEPROM_WRITE_DELAY_MS);
     }
 
     /* Strict read-back verification: read every written block back and verify */
-    FURI_LOG_I(TAG, "Verifying %u written blocks...", (unsigned)blocks);
-    furi_delay_ms(30);
-
-    for(size_t b = 0; b < blocks; b++) {
-        uint8_t readback[4] = {0};
-        bool verified_block = false;
-
-        for(int attempt = 0; attempt < 5; attempt++) {
-            if(read_block(iso, (uint8_t)b, readback)) {
-                if(memcmp(readback, &data[b * block_size], block_size) == 0) {
-                    verified_block = true;
-                    break;
-                }
-                FURI_LOG_W(
-                    TAG,
-                    "Block %u readback mismatch (attempt %d): [%02X %02X %02X %02X] != [%02X %02X %02X %02X]",
-                    (unsigned)b,
-                    attempt,
-                    readback[0], readback[1], readback[2], readback[3],
-                    data[b * block_size],
-                    data[b * block_size + 1],
-                    data[b * block_size + 2],
-                    data[b * block_size + 3]);
-            }
-            furi_delay_ms(20);
-        }
-
-        if(!verified_block) {
-            FURI_LOG_E(TAG, "Block %u readback verification failed!", (unsigned)b);
-            return WriteResultBlockVerifyFailed;
-        }
-    }
-
-    FURI_LOG_I(TAG, "All %u blocks verified successfully!", (unsigned)blocks);
-    return WriteResultOk;
-}
-
-/* ============================================================================
- *  Special block read helper (addressed, flags=0x22)
- * ========================================================================== */
-
-static bool read_block_addressed(
-    Iso15693_3Poller* iso,
-    const uint8_t uid_msb[8],
-    uint8_t block_number,
-    uint8_t data[4])
-{
-    BitBuffer* tx = bit_buffer_alloc(11 * 8);
-    if(!tx) return false;
-    bit_buffer_append_byte(tx, 0x22); /* High data rate + Addressed */
-    bit_buffer_append_byte(tx, ISO15693_CMD_READ_BLOCK);
-    append_uid_wire_order(tx, uid_msb);
-    bit_buffer_append_byte(tx, block_number);
-
-    BitBuffer* rx = bb_alloc_rx(16);
-    if(!rx) {
-        bit_buffer_free(tx);
-        return false;
-    }
-
-    Iso15693_3Error err = iso15693_3_poller_send_frame(iso, tx, rx, ISO15693_FWT_FC);
-    bool ok = (err == Iso15693_3ErrorNone) && iso_reply_ok(rx);
-    size_t rxsz = bit_buffer_get_size_bytes(rx);
-
-    if(ok && rxsz >= 5) {
-        for(size_t i = 0; i < 4; i++) {
-            data[i] = bit_buffer_get_byte(rx, 1 + i);
-        }
-    } else {
-        ok = false;
-    }
-
-    bit_buffer_free(tx);
-    bit_buffer_free(rx);
-    return ok;
+    return verify_blocks(iso, NULL, data, blocks, block_size);
 }
 
 /* ============================================================================
@@ -766,7 +704,7 @@ static WriteResult write_blocks_addressed(
     FURI_LOG_I(TAG, "write_blocks_addressed: %u blocks (flags=0x62)", (unsigned)blocks);
 
     for(size_t b = 0; b < blocks; b++) {
-        BitBuffer* tx = bit_buffer_alloc(15 * 8);
+        BitBuffer* tx = bit_buffer_alloc(15);
         if(!tx) return WriteResultBlockWriteFailed;
         bit_buffer_append_byte(tx, 0x62);
         bit_buffer_append_byte(tx, ISO15693_CMD_WRITE_BLOCK);
@@ -809,41 +747,7 @@ static WriteResult write_blocks_addressed(
     }
 
     /* Strict read-back verification: read every written block back and verify */
-    FURI_LOG_I(TAG, "Verifying %u written blocks...", (unsigned)blocks);
-    furi_delay_ms(30);
-
-    for(size_t b = 0; b < blocks; b++) {
-        uint8_t readback[4] = {0};
-        bool verified_block = false;
-
-        for(int attempt = 0; attempt < 5; attempt++) {
-            if(read_block_addressed(iso, uid_msb, (uint8_t)b, readback)) {
-                if(memcmp(readback, &data[b * block_size], block_size) == 0) {
-                    verified_block = true;
-                    break;
-                }
-                FURI_LOG_W(
-                    TAG,
-                    "Block %u readback mismatch (attempt %d): [%02X %02X %02X %02X] != [%02X %02X %02X %02X]",
-                    (unsigned)b,
-                    attempt,
-                    readback[0], readback[1], readback[2], readback[3],
-                    data[b * block_size],
-                    data[b * block_size + 1],
-                    data[b * block_size + 2],
-                    data[b * block_size + 3]);
-            }
-            furi_delay_ms(20);
-        }
-
-        if(!verified_block) {
-            FURI_LOG_E(TAG, "Block %u readback verification failed!", (unsigned)b);
-            return WriteResultBlockVerifyFailed;
-        }
-    }
-
-    FURI_LOG_I(TAG, "All %u blocks verified successfully!", (unsigned)blocks);
-    return WriteResultOk;
+    return verify_blocks(iso, uid_msb, data, blocks, block_size);
 }
 
 /* ============================================================================
@@ -1054,52 +958,13 @@ static WriteResult do_normal_write(SliWriterApp* app, Iso15693_3Poller* iso) {
     select_card(iso, app->detected_uid);
     furi_delay_ms(10);
 
-    /* On Gen3, clamp blocks strictly to 8 (Tonie size) as defense-in-depth */
     uint8_t blocks_to_write = app->nfc_data.block_count;
-    if(gen3 == GEN3_YES && blocks_to_write > 8) {
-        blocks_to_write = 8;
-    }
-
     FURI_LOG_I(TAG, "Normal write: %u blocks", blocks_to_write);
     WriteResult b_res = write_blocks(iso, app->nfc_data.data, blocks_to_write, app->nfc_data.block_size);
     if(b_res != WriteResultOk) {
         return b_res;
     }
-    FURI_LOG_I(TAG, "Blocks OK");
-
-    /* Verify all written data blocks byte-for-byte */
-    FURI_LOG_I(TAG, "Verifying %u written blocks...", (unsigned)blocks_to_write);
-    furi_delay_ms(20);
-
-    for(uint8_t b = 0; b < blocks_to_write; b++) {
-        uint8_t readback[4] = {0};
-        bool verified = false;
-
-        for(int attempt = 0; attempt < 5; attempt++) {
-            if(read_single_block(iso, b, readback) == BlockReadOk) {
-                if(memcmp(readback, &app->nfc_data.data[b * app->nfc_data.block_size], app->nfc_data.block_size) == 0) {
-                    verified = true;
-                    break;
-                }
-                FURI_LOG_W(
-                    TAG,
-                    "Block %u readback mismatch (attempt %d): [%02X %02X %02X %02X] != [%02X %02X %02X %02X]",
-                    (unsigned)b,
-                    attempt,
-                    readback[0], readback[1], readback[2], readback[3],
-                    app->nfc_data.data[b * 4], app->nfc_data.data[b * 4 + 1],
-                    app->nfc_data.data[b * 4 + 2], app->nfc_data.data[b * 4 + 3]);
-            }
-            furi_delay_ms(20);
-        }
-
-        if(!verified) {
-            FURI_LOG_E(TAG, "Data verify failed on block %u", (unsigned)b);
-            furi_string_set(app->error_message, "Data verify failed");
-            return false;
-        }
-    }
-    FURI_LOG_I(TAG, "Data blocks verified OK");
+    FURI_LOG_I(TAG, "Blocks written and verified OK");
 
     /* If Gen3, confirm signature blocks 0x14/0x15 remain intact after data writes */
     if(gen3 == GEN3_YES) {
