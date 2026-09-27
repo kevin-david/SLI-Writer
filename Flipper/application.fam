@@ -6,5 +6,5 @@ App(
     requires=["gui", "dialogs", "storage", "nfc", "notification"],
     stack_size=4096,
     order=10,
-    fap_category=App
+    fap_category="NFC",
 )

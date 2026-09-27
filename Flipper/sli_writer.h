@@ -82,6 +82,8 @@ typedef enum {
     SliWriterCustomEventSaveUidSuccess,
 } SliWriterCustomEvent;
 
+#define SLI_DIALOG_RESULT_OFFSET 200
+
 /* ============================================================================
  *  Parsed .nfc data
  * ========================================================================== */
@@ -124,6 +126,7 @@ typedef struct {
     SliWriterMode    write_mode;
 
     /* State */
+    bool             in_about;
     bool             have_uid;
     uint8_t          detected_uid[8];   /* UID of the card currently in field  */
 

@@ -110,6 +110,41 @@ static bool iso_send_raw(
 }
 
 /* ============================================================================
+ *  Reset card to Ready state helper
+ * ========================================================================== */
+
+static bool reset_card_to_ready(Iso15693_3Poller* iso, const uint8_t uid_lsb[8]) {
+    /* 1. Addressed Reset to Ready (0x22 0x26 <UID 8 bytes LSB-first>) */
+    if(uid_lsb) {
+        uint8_t frame_reset[10];
+        frame_reset[0] = 0x22; /* High data rate + Addressed */
+        frame_reset[1] = 0x26; /* ISO15693 RESET_TO_READY */
+        memcpy(&frame_reset[2], uid_lsb, 8);
+        iso_send_raw(iso, frame_reset, sizeof(frame_reset), ISO15693_FWT_FC);
+        furi_delay_ms(20);
+    }
+
+    /* 2. Non-addressed Reset to Ready (0x02 0x26) */
+    uint8_t frame_non_addressed[2] = {0x02, 0x26};
+    iso_send_raw(iso, frame_non_addressed, sizeof(frame_non_addressed), ISO15693_FWT_FC);
+    furi_delay_ms(20);
+
+    /* 3. Run inventory to ensure card is active in field and in Ready state */
+    uint8_t resync_uid[8];
+    for(int i = 0; i < 5; i++) {
+        if(iso15693_3_poller_inventory(iso, resync_uid) == Iso15693_3ErrorNone) {
+            FURI_LOG_I(TAG, "Card reset to ready, UID: %02X%02X%02X%02X%02X%02X%02X%02X",
+                       resync_uid[7], resync_uid[6], resync_uid[5], resync_uid[4],
+                       resync_uid[3], resync_uid[2], resync_uid[1], resync_uid[0]);
+            return true;
+        }
+        furi_delay_ms(25);
+    }
+    FURI_LOG_W(TAG, "Card inventory resync failed after reset_to_ready");
+    return false;
+}
+
+/* ============================================================================
  *  Magic UID write (non-addressed, used for both Normal and Special modes)
  * ========================================================================== */
 
@@ -128,21 +163,34 @@ static bool magic_write_uid(Iso15693_3Poller* iso, const uint8_t uid_msb[8]) {
     FURI_LOG_I(TAG, "magic_write_uid HIGH: %02X%02X%02X%02X",
                uid_msb[0], uid_msb[1], uid_msb[2], uid_msb[3]);
     bool ok = false;
-    for(int i = 0; i < 3; i++) {
-        if(iso_send_raw(iso, frame_high, sizeof(frame_high), ISO15693_FWT_FC)) { ok = true; break; }
-        furi_delay_ms(10);
+    for(int i = 0; i < 5; i++) {
+        if(iso_send_raw(iso, frame_high, sizeof(frame_high), 1000000)) { ok = true; break; }
+        furi_delay_ms(25);
     }
     if(!ok) { FURI_LOG_E(TAG, "SET_UID_HIGH failed"); return false; }
-    furi_delay_ms(20);
+    furi_delay_ms(50);
 
     FURI_LOG_I(TAG, "magic_write_uid LOW:  %02X%02X%02X%02X",
                uid_msb[4], uid_msb[5], uid_msb[6], uid_msb[7]);
     ok = false;
-    for(int i = 0; i < 3; i++) {
-        if(iso_send_raw(iso, frame_low, sizeof(frame_low), ISO15693_FWT_FC)) { ok = true; break; }
-        furi_delay_ms(10);
+    for(int i = 0; i < 5; i++) {
+        if(iso_send_raw(iso, frame_low, sizeof(frame_low), 1000000)) { ok = true; break; }
+        furi_delay_ms(25);
     }
     if(!ok) { FURI_LOG_E(TAG, "SET_UID_LOW failed"); return false; }
+
+    /* Verification inventory */
+    furi_delay_ms(50);
+    uint8_t verify_lsb[8];
+    for(int i = 0; i < 5; i++) {
+        if(iso15693_3_poller_inventory(iso, verify_lsb) == Iso15693_3ErrorNone) {
+            FURI_LOG_I(TAG, "Post-write UID: %02X%02X%02X%02X%02X%02X%02X%02X",
+                       verify_lsb[7], verify_lsb[6], verify_lsb[5], verify_lsb[4],
+                       verify_lsb[3], verify_lsb[2], verify_lsb[1], verify_lsb[0]);
+            break;
+        }
+        furi_delay_ms(25);
+    }
 
     return true;
 }
@@ -396,6 +444,10 @@ static bool do_normal_write(SliWriterApp* app, Iso15693_3Poller* iso) {
     static const uint8_t zero_uid[8] = {0};
     if(memcmp(app->nfc_data.uid, zero_uid, 8) != 0 &&
        memcmp(app->nfc_data.uid, app->detected_uid, 8) != 0) {
+        furi_delay_ms(30);
+        reset_card_to_ready(iso, NULL);
+        furi_delay_ms(20);
+
         FURI_LOG_I(TAG, "Writing target UID...");
         if(!magic_write_uid(iso, app->nfc_data.uid)) {
             furi_string_set(app->error_message, "UID write failed");
@@ -464,11 +516,27 @@ static bool do_special_write(SliWriterApp* app, Iso15693_3Poller* iso) {
     }
     FURI_LOG_I(TAG, "Blocks OK");
 
+    /* Wait for card EEPROM write to settle after block writes */
+    furi_delay_ms(100);
+
+    /* Reset card out of Addressed state back into Ready state before UID write */
+    FURI_LOG_I(TAG, "Resetting card to ready state before UID write...");
+    if(!reset_card_to_ready(iso, app->special_uid)) {
+        FURI_LOG_E(TAG, "Card not responding after block write");
+        furi_string_set(app->error_message, "Card lost before UID write");
+        return false;
+    }
+    furi_delay_ms(30);
+
     /* Step 3: set target UID */
     static const uint8_t zero_uid[8] = {0};
     if(memcmp(app->nfc_data.uid, zero_uid, 8) != 0 &&
-       memcmp(app->nfc_data.uid, app->special_uid, 8) != 0) {
-        FURI_LOG_I(TAG, "Step 3: write target UID");
+       memcmp(app->nfc_data.uid, factory_uid_msb, 8) != 0) {
+        FURI_LOG_I(TAG, "Step 3: write target UID (MSB: %02X%02X%02X%02X%02X%02X%02X%02X)",
+                   app->nfc_data.uid[0], app->nfc_data.uid[1],
+                   app->nfc_data.uid[2], app->nfc_data.uid[3],
+                   app->nfc_data.uid[4], app->nfc_data.uid[5],
+                   app->nfc_data.uid[6], app->nfc_data.uid[7]);
         if(!magic_write_uid(iso, app->nfc_data.uid)) {
             furi_string_set(app->error_message, "Target UID write failed");
             return false;
@@ -558,7 +626,7 @@ void sli_writer_submenu_callback(void* context, uint32_t index) {
 
 void sli_writer_dialog_ex_callback(DialogExResult result, void* context) {
     SliWriterApp* app = context;
-    view_dispatcher_send_custom_event(app->view_dispatcher, result);
+    view_dispatcher_send_custom_event(app->view_dispatcher, SLI_DIALOG_RESULT_OFFSET + result);
 }
 
 bool sli_writer_custom_event_callback(void* context, uint32_t event) {
@@ -578,6 +646,7 @@ bool sli_writer_back_event_callback(void* context) {
 /* --- Start --- */
 void sli_writer_scene_start_on_enter(void* context) {
     SliWriterApp* app = context;
+    app->in_about = false;
     submenu_reset(app->submenu);
 
     submenu_add_item(app->submenu, "Write NFC File",
@@ -612,7 +681,25 @@ void sli_writer_scene_start_on_enter(void* context) {
 
 bool sli_writer_scene_start_on_event(void* context, SceneManagerEvent event) {
     SliWriterApp* app = context;
+
+    if(event.type == SceneManagerEventTypeBack) {
+        if(app->in_about) {
+            app->in_about = false;
+            view_dispatcher_switch_to_view(app->view_dispatcher, SliWriterViewSubmenu);
+            return true;
+        }
+        return false;
+    }
+
     if(event.type != SceneManagerEventTypeCustom) return false;
+
+    if(event.event >= SLI_DIALOG_RESULT_OFFSET) {
+        if(app->in_about) {
+            app->in_about = false;
+            view_dispatcher_switch_to_view(app->view_dispatcher, SliWriterViewSubmenu);
+            return true;
+        }
+    }
 
     if(event.event == SliWriterSubmenuIndexWrite) {
         app->write_mode = SliWriterModeNormal;
@@ -639,12 +726,14 @@ bool sli_writer_scene_start_on_event(void* context, SceneManagerEvent event) {
     }
 
     if(event.event == SliWriterSubmenuIndexAbout) {
+        app->in_about = true;
         dialog_ex_reset(app->dialog_ex);
         dialog_ex_set_header(app->dialog_ex, "SLI Writer", 64, 0, AlignCenter, AlignTop);
         dialog_ex_set_text(app->dialog_ex,
             "ISO15693 magic card writer\nSLI / SLIX-L / Special",
             64, 32, AlignCenter, AlignCenter);
         dialog_ex_set_left_button_text(app->dialog_ex, "Back");
+        dialog_ex_set_center_button_text(app->dialog_ex, "OK");
         view_dispatcher_switch_to_view(app->view_dispatcher, SliWriterViewDialogEx);
         return true;
     }
@@ -653,6 +742,7 @@ bool sli_writer_scene_start_on_event(void* context, SceneManagerEvent event) {
 
 void sli_writer_scene_start_on_exit(void* context) {
     SliWriterApp* app = context;
+    app->in_about = false;
     submenu_reset(app->submenu);
 }
 
@@ -699,6 +789,7 @@ void sli_writer_scene_write_on_enter(void* context) {
         dialog_ex_set_text(app->dialog_ex, "Approach card\nto Flipper...",
                            64, 32, AlignCenter, AlignCenter);
     }
+    dialog_ex_set_left_button_text(app->dialog_ex, "Back");
     view_dispatcher_switch_to_view(app->view_dispatcher, SliWriterViewDialogEx);
 
     NotificationApp* notif = furi_record_open(RECORD_NOTIFICATION);
@@ -708,7 +799,6 @@ void sli_writer_scene_write_on_enter(void* context) {
     app->have_uid = false;
     furi_string_reset(app->error_message);
 
-    app->nfc    = nfc_alloc();
     app->poller = nfc_poller_alloc(app->nfc, NfcProtocolIso15693_3);
     app->nfc_started = true;
 
@@ -718,6 +808,16 @@ void sli_writer_scene_write_on_enter(void* context) {
 
 bool sli_writer_scene_write_on_event(void* context, SceneManagerEvent event) {
     SliWriterApp* app = context;
+
+    if(event.type == SceneManagerEventTypeBack ||
+       (event.type == SceneManagerEventTypeCustom &&
+        (event.event == (SLI_DIALOG_RESULT_OFFSET + DialogExResultLeft) ||
+         event.event == (SLI_DIALOG_RESULT_OFFSET + DialogExResultCenter)))) {
+        scene_manager_search_and_switch_to_another_scene(
+            app->scene_manager, SliWriterSceneStart);
+        return true;
+    }
+
     if(event.type == SceneManagerEventTypeCustom) {
         if(event.event == SliWriterCustomEventWriteSuccess ||
            event.event == SliWriterCustomEventSaveUidSuccess) {
@@ -734,12 +834,10 @@ bool sli_writer_scene_write_on_event(void* context, SceneManagerEvent event) {
 
 void sli_writer_scene_write_on_exit(void* context) {
     SliWriterApp* app = context;
-    if(app->nfc_started) {
+    if(app->poller) {
         nfc_poller_stop(app->poller);
         nfc_poller_free(app->poller);
-        nfc_free(app->nfc);
         app->poller      = NULL;
-        app->nfc         = NULL;
         app->nfc_started = false;
     }
 }
@@ -762,15 +860,16 @@ void sli_writer_scene_success_on_enter(void* context) {
         dialog_ex_set_text(app->dialog_ex, "Card written successfully",
                            64, 32, AlignCenter, AlignCenter);
     }
-    dialog_ex_set_left_button_text(app->dialog_ex, "OK");
+    dialog_ex_set_center_button_text(app->dialog_ex, "OK");
+    dialog_ex_set_left_button_text(app->dialog_ex, "Back");
     view_dispatcher_switch_to_view(app->view_dispatcher, SliWriterViewDialogEx);
 }
 
 bool sli_writer_scene_success_on_event(void* context, SceneManagerEvent event) {
     SliWriterApp* app = context;
     if(event.type == SceneManagerEventTypeBack ||
-       (event.type == SceneManagerEventTypeCustom && event.event == DialogExResultLeft)) {
-        scene_manager_search_and_switch_to_previous_scene(
+       (event.type == SceneManagerEventTypeCustom && event.event >= SLI_DIALOG_RESULT_OFFSET)) {
+        scene_manager_search_and_switch_to_another_scene(
             app->scene_manager, SliWriterSceneStart);
         return true;
     }
@@ -789,15 +888,16 @@ void sli_writer_scene_error_on_enter(void* context) {
     dialog_ex_set_header(app->dialog_ex, "Error", 64, 0, AlignCenter, AlignTop);
     dialog_ex_set_text(app->dialog_ex, furi_string_get_cstr(app->error_message),
                        64, 32, AlignCenter, AlignCenter);
-    dialog_ex_set_left_button_text(app->dialog_ex, "OK");
+    dialog_ex_set_center_button_text(app->dialog_ex, "OK");
+    dialog_ex_set_left_button_text(app->dialog_ex, "Back");
     view_dispatcher_switch_to_view(app->view_dispatcher, SliWriterViewDialogEx);
 }
 
 bool sli_writer_scene_error_on_event(void* context, SceneManagerEvent event) {
     SliWriterApp* app = context;
     if(event.type == SceneManagerEventTypeBack ||
-       (event.type == SceneManagerEventTypeCustom && event.event == DialogExResultLeft)) {
-        scene_manager_search_and_switch_to_previous_scene(
+       (event.type == SceneManagerEventTypeCustom && event.event >= SLI_DIALOG_RESULT_OFFSET)) {
+        scene_manager_search_and_switch_to_another_scene(
             app->scene_manager, SliWriterSceneStart);
         return true;
     }
@@ -857,6 +957,8 @@ SliWriterApp* sli_writer_app_alloc(void) {
     app->storage = furi_record_open(RECORD_STORAGE);
     app->dialogs = furi_record_open(RECORD_DIALOGS);
 
+    app->nfc = nfc_alloc();
+
     app->view_dispatcher = view_dispatcher_alloc();
     app->scene_manager   = scene_manager_alloc(&sli_scene_handlers, app);
 
@@ -893,10 +995,15 @@ SliWriterApp* sli_writer_app_alloc(void) {
 void sli_writer_app_free(SliWriterApp* app) {
     furi_assert(app);
 
-    if(app->nfc_started) {
+    if(app->poller) {
         nfc_poller_stop(app->poller);
         nfc_poller_free(app->poller);
+        app->poller = NULL;
+    }
+
+    if(app->nfc) {
         nfc_free(app->nfc);
+        app->nfc = NULL;
     }
 
     view_dispatcher_remove_view(app->view_dispatcher, SliWriterViewSubmenu);
