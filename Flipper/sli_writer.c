@@ -392,9 +392,11 @@ static Gen3Detection detect_gen3(Iso15693_3Poller* iso) {
 
     /* Blocks 0x14/0x15 are readable but don't match unfinalized Gen3 signature.
      * Check system info: if tag reports >= 80 blocks, it is a Gen3 tag whose signature
-     * is corrupted or finalized. Fail safely (GEN3_UNKNOWN) rather than treating as Gen2. */
+     * is corrupted or finalized. Fail safely (GEN3_UNKNOWN) rather than treating as Gen2.
+     * If system info query itself fails due to comm/timeout error, also fail safely. */
     Iso15693_3SystemInfo sys_info;
-    if(iso15693_3_poller_get_system_info(iso, &sys_info) == Iso15693_3ErrorNone) {
+    Iso15693_3Error sys_err = iso15693_3_poller_get_system_info(iso, &sys_info);
+    if(sys_err == Iso15693_3ErrorNone) {
         if((sys_info.flags & ISO15693_3_SYSINFO_FLAG_MEMORY) && sys_info.block_count >= 80) {
             FURI_LOG_E(
                 TAG,
@@ -402,6 +404,9 @@ static Gen3Detection detect_gen3(Iso15693_3Poller* iso) {
                 sys_info.block_count);
             return GEN3_UNKNOWN;
         }
+    } else if(sys_err != Iso15693_3ErrorNotSupported) {
+        FURI_LOG_W(TAG, "detect_gen3: system info query failed (err=%d)", (int)sys_err);
+        return GEN3_UNKNOWN;
     }
 
     return GEN3_NO;
