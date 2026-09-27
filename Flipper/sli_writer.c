@@ -628,11 +628,19 @@ static WriteResult write_blocks(
         for(int attempt = 0; attempt < 5 && !wrote; attempt++) {
             wrote = iso_send_raw(iso, wframe, sizeof(wframe), ISO15693_FWT_FC);
             if(!wrote) {
+                furi_delay_ms(20);
+                /* Check if EEPROM burn succeeded despite dropped response ACK */
+                uint8_t current[4] = {0};
+                if(read_single_block(iso, (uint8_t)b, current) == BlockReadOk &&
+                   memcmp(current, &wframe[3], 4) == 0) {
+                    FURI_LOG_I(TAG, "Block %u: verified via read-back despite missing ACK", (unsigned)b);
+                    wrote = true;
+                    break;
+                }
                 if(wframe[0] == 0x02) {
                     FURI_LOG_W(TAG, "Block %u: retrying with Option flag (0x42)", (unsigned)b);
                     wframe[0] = 0x42;
                 }
-                furi_delay_ms(20);
             }
         }
         if(!wrote) {
