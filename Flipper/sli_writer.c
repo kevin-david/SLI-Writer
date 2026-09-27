@@ -281,10 +281,45 @@ static void select_card(Iso15693_3Poller* iso, const uint8_t uid_msb[8]) {
 }
 
 /* ============================================================================
+ *  Normal block read helper (non-addressed, flags=0x02)
+ * ========================================================================== */
+
+static bool read_block(Iso15693_3Poller* iso, uint8_t block_number, uint8_t data[4]) {
+    uint8_t frame[3];
+    frame[0] = 0x02; /* High data rate */
+    frame[1] = ISO15693_CMD_READ_BLOCK;
+    frame[2] = block_number;
+
+    BitBuffer* tx = bb_alloc_from(frame, sizeof(frame));
+    if(!tx) return false;
+    BitBuffer* rx = bb_alloc_rx(16);
+    if(!rx) {
+        bit_buffer_free(tx);
+        return false;
+    }
+
+    Iso15693_3Error err = iso15693_3_poller_send_frame(iso, tx, rx, ISO15693_FWT_FC);
+    bool ok = (err == Iso15693_3ErrorNone) && iso_reply_ok(rx);
+    size_t rxsz = bit_buffer_get_size_bytes(rx);
+
+    if(ok && rxsz >= 5) {
+        for(size_t i = 0; i < 4; i++) {
+            data[i] = bit_buffer_get_byte(rx, 1 + i);
+        }
+    } else {
+        ok = false;
+    }
+
+    bit_buffer_free(tx);
+    bit_buffer_free(rx);
+    return ok;
+}
+
+/* ============================================================================
  *  Normal block write (non-addressed, flags=0x02, auto-retry with 0x42)
  * ========================================================================== */
 
-static bool write_blocks(
+static WriteResult write_blocks(
     Iso15693_3Poller* iso,
     const uint8_t* data,
     uint8_t block_count,
@@ -314,10 +349,49 @@ static bool write_blocks(
                 furi_delay_ms(20);
             }
         }
-        if(!wrote) { FURI_LOG_E(TAG, "write_blocks: block %u failed", (unsigned)b); return false; }
+        if(!wrote) {
+            FURI_LOG_E(TAG, "write_blocks: block %u failed", (unsigned)b);
+            return WriteResultBlockWriteFailed;
+        }
         furi_delay_ms(20);
     }
-    return true;
+
+    /* Strict read-back verification: read every written block back and verify */
+    FURI_LOG_I(TAG, "Verifying %u written blocks...", (unsigned)blocks);
+    furi_delay_ms(30);
+
+    for(size_t b = 0; b < blocks; b++) {
+        uint8_t readback[4] = {0};
+        bool verified_block = false;
+
+        for(int attempt = 0; attempt < 5; attempt++) {
+            if(read_block(iso, (uint8_t)b, readback)) {
+                if(memcmp(readback, &data[b * block_size], block_size) == 0) {
+                    verified_block = true;
+                    break;
+                }
+                FURI_LOG_W(
+                    TAG,
+                    "Block %u readback mismatch (attempt %d): [%02X %02X %02X %02X] != [%02X %02X %02X %02X]",
+                    (unsigned)b,
+                    attempt,
+                    readback[0], readback[1], readback[2], readback[3],
+                    data[b * block_size],
+                    data[b * block_size + 1],
+                    data[b * block_size + 2],
+                    data[b * block_size + 3]);
+            }
+            furi_delay_ms(20);
+        }
+
+        if(!verified_block) {
+            FURI_LOG_E(TAG, "Block %u readback verification failed!", (unsigned)b);
+            return WriteResultBlockVerifyFailed;
+        }
+    }
+
+    FURI_LOG_I(TAG, "All %u blocks verified successfully!", (unsigned)blocks);
+    return WriteResultOk;
 }
 
 /* ============================================================================
@@ -365,7 +439,7 @@ static bool read_block_addressed(
  *  flags=0x62: high data rate(0x02) + addressed(0x20) + option(0x40)
  * ========================================================================== */
 
-static bool write_blocks_addressed(
+static WriteResult write_blocks_addressed(
     Iso15693_3Poller* iso,
     const uint8_t uid_msb[8],
     const uint8_t* data,
@@ -379,7 +453,7 @@ static bool write_blocks_addressed(
 
     for(size_t b = 0; b < blocks; b++) {
         BitBuffer* tx = bit_buffer_alloc(15 * 8);
-        if(!tx) return false;
+        if(!tx) return WriteResultBlockWriteFailed;
         bit_buffer_append_byte(tx, 0x62);
         bit_buffer_append_byte(tx, ISO15693_CMD_WRITE_BLOCK);
         append_uid_wire_order(tx, uid_msb);
@@ -394,7 +468,7 @@ static bool write_blocks_addressed(
         BitBuffer* rx = bb_alloc_rx(16);
         if(!rx) {
             bit_buffer_free(tx);
-            return false;
+            return WriteResultBlockWriteFailed;
         }
 
         /* Extended FWT for Option flag (2-phase response) */
@@ -414,7 +488,7 @@ static bool write_blocks_addressed(
 
         if(card_error) {
             FURI_LOG_E(TAG, "Block %u: card error", (unsigned)b);
-            return false;
+            return WriteResultBlockWriteFailed;
         }
 
         furi_delay_ms(25);
@@ -450,12 +524,12 @@ static bool write_blocks_addressed(
 
         if(!verified_block) {
             FURI_LOG_E(TAG, "Block %u readback verification failed!", (unsigned)b);
-            return false;
+            return WriteResultBlockVerifyFailed;
         }
     }
 
     FURI_LOG_I(TAG, "All %u blocks verified successfully!", (unsigned)blocks);
-    return true;
+    return WriteResultOk;
 }
 
 /* ============================================================================
@@ -508,16 +582,15 @@ bool sli_writer_parse_nfc_file(SliWriterApp* app, const char* path) {
     File* f = storage_file_alloc(app->storage);
     bool ok = false;
 
+    memset(&app->nfc_data, 0x00, sizeof(app->nfc_data));
+    furi_string_reset(app->error_message);
+
     if(storage_file_open(f, path, FSAM_READ, FSOM_OPEN_EXISTING)) {
         size_t sz = storage_file_size(f);
         char* buf = malloc(sz + 1);
         if(buf) {
             size_t n = storage_file_read(f, buf, sz);
             buf[n] = '\0';
-
-            memset(&app->nfc_data, 0x00, sizeof(app->nfc_data));
-            app->nfc_data.block_size  = 0;
-            app->nfc_data.block_count = 0;
 
             char* p;
             size_t uid_count = 0;
@@ -534,60 +607,83 @@ bool sli_writer_parse_nfc_file(SliWriterApp* app, const char* path) {
                     q = end;
                     uid_count++;
                 }
+            }
 
-                if((p = strstr(buf, "Block Count: "))) {
-                    sscanf(p + 13, "%hhu", &app->nfc_data.block_count);
-                }
-
-                if((p = strstr(buf, "Block Size: "))) {
-                    sscanf(p + 12, "%hhu", &app->nfc_data.block_size);
-                }
-
-                size_t data_bytes_parsed = 0;
-                size_t expected_total = (size_t)app->nfc_data.block_count * app->nfc_data.block_size;
-
-                if(expected_total > 0 && expected_total <= sizeof(app->nfc_data.data)) {
-                    if((p = strstr(buf, "Data Content: "))) {
-                        p += 14;
-                        char* q2 = p;
-                        for(size_t i = 0; i < expected_total; i++) {
-                            while(*q2 == ' ' || *q2 == '\r' || *q2 == '\n') q2++;
-                            char* end2 = NULL;
-                            long val = strtol(q2, &end2, 16);
-                            if(end2 == q2 || val < 0 || val > 0xFF) break;
-                            app->nfc_data.data[i] = (uint8_t)val;
-                            q2 = end2;
-                            data_bytes_parsed++;
-                        }
-                    }
-                }
-
-                if(uid_count == 8 &&
-                   app->nfc_data.block_count > 0 &&
-                   app->nfc_data.block_count <= SLI_MAGIC_MAX_BLOCKS &&
-                   app->nfc_data.block_size == 4 &&
-                   data_bytes_parsed == expected_total) {
-                    FURI_LOG_I(TAG, "Parsed valid .nfc: blocks=%u size=%u uid=%02X%02X%02X%02X%02X%02X%02X%02X",
-                               app->nfc_data.block_count, app->nfc_data.block_size,
-                               app->nfc_data.uid[0], app->nfc_data.uid[1],
-                               app->nfc_data.uid[2], app->nfc_data.uid[3],
-                               app->nfc_data.uid[4], app->nfc_data.uid[5],
-                               app->nfc_data.uid[6], app->nfc_data.uid[7]);
-                    ok = true;
-                } else {
-                    FURI_LOG_E(TAG, "Invalid .nfc file: uid_count=%u blocks=%u size=%u data_bytes=%u/%u",
-                               (unsigned)uid_count,
-                               (unsigned)app->nfc_data.block_count,
-                               (unsigned)app->nfc_data.block_size,
-                               (unsigned)data_bytes_parsed,
-                               (unsigned)expected_total);
+            if((p = strstr(buf, "Block Count: "))) {
+                char* end = NULL;
+                long val = strtol(p + 13, &end, 0);
+                if(val > 0 && val <= SLI_MAGIC_MAX_BLOCKS) {
+                    app->nfc_data.block_count = (uint8_t)val;
                 }
             }
+
+            if((p = strstr(buf, "Block Size: "))) {
+                char* end = NULL;
+                long val = strtol(p + 12, &end, 0);
+                if(val > 0 && val <= 255) {
+                    app->nfc_data.block_size = (uint8_t)val;
+                }
+            }
+
+            size_t data_bytes_parsed = 0;
+            size_t expected_total = (size_t)app->nfc_data.block_count * app->nfc_data.block_size;
+
+            if(expected_total > 0 && expected_total <= sizeof(app->nfc_data.data)) {
+                if((p = strstr(buf, "Data Content: "))) {
+                    p += 14;
+                    char* q2 = p;
+                    for(size_t i = 0; i < expected_total; i++) {
+                        while(*q2 == ' ' || *q2 == '\r' || *q2 == '\n' || *q2 == '\t') q2++;
+                        if(*q2 == '\0') break;
+                        char* end2 = NULL;
+                        long val = strtol(q2, &end2, 16);
+                        if(end2 == q2 || val < 0 || val > 0xFF) break;
+                        app->nfc_data.data[i] = (uint8_t)val;
+                        q2 = end2;
+                        data_bytes_parsed++;
+                    }
+                }
+            }
+
+            /* Strict validation to prevent partial / zero-filled data from reaching writer:
+             * 1. Exact 8-byte UID
+             * 2. block_count between 1 and SLI_MAGIC_MAX_BLOCKS
+             * 3. block_size == 4
+             * 4. Data Content contains exactly block_count * block_size valid bytes */
+            if(uid_count != 8) {
+                furi_string_set(app->error_message, "Invalid UID in .nfc");
+                FURI_LOG_E(TAG, "Parse error: expected 8 UID bytes, found %u", (unsigned)uid_count);
+            } else if(app->nfc_data.block_count == 0 || app->nfc_data.block_count > SLI_MAGIC_MAX_BLOCKS) {
+                furi_string_set(app->error_message, "Invalid block count in .nfc");
+                FURI_LOG_E(TAG, "Parse error: invalid block count %u", (unsigned)app->nfc_data.block_count);
+            } else if(app->nfc_data.block_size != 4) {
+                furi_string_set(app->error_message, "Invalid block size (must be 4)");
+                FURI_LOG_E(TAG, "Parse error: unsupported block size %u", (unsigned)app->nfc_data.block_size);
+            } else if(data_bytes_parsed != expected_total) {
+                furi_string_set(app->error_message, "Incomplete data in .nfc file");
+                FURI_LOG_E(TAG, "Parse error: incomplete data %u / %u bytes",
+                           (unsigned)data_bytes_parsed, (unsigned)expected_total);
+            } else {
+                FURI_LOG_I(TAG, "Parsed valid .nfc: blocks=%u size=%u uid=%02X%02X%02X%02X%02X%02X%02X%02X",
+                           app->nfc_data.block_count, app->nfc_data.block_size,
+                           app->nfc_data.uid[0], app->nfc_data.uid[1],
+                           app->nfc_data.uid[2], app->nfc_data.uid[3],
+                           app->nfc_data.uid[4], app->nfc_data.uid[5],
+                           app->nfc_data.uid[6], app->nfc_data.uid[7]);
+                ok = true;
+            }
+
             free(buf);
         }
         storage_file_close(f);
+    } else {
+        furi_string_set(app->error_message, "Cannot open .nfc file");
     }
     storage_file_free(f);
+
+    if(!ok) {
+        memset(&app->nfc_data, 0x00, sizeof(app->nfc_data));
+    }
     return ok;
 }
 
@@ -597,13 +693,20 @@ bool sli_writer_parse_nfc_file(SliWriterApp* app, const char* path) {
 
 /* Normal write: SELECT -> write blocks (non-addressed) -> write UID */
 static WriteResult do_normal_write(SliWriterApp* app, Iso15693_3Poller* iso) {
+    if(app->nfc_data.block_count == 0 || app->nfc_data.block_size != 4) {
+        FURI_LOG_E(TAG, "Cannot write: invalid or incomplete NFC data");
+        furi_string_set(app->error_message, "Incomplete NFC data");
+        return WriteResultBlockWriteFailed;
+    }
+
     select_card(iso, app->detected_uid);
     furi_delay_ms(10);
 
     FURI_LOG_I(TAG, "Normal write: %u blocks", app->nfc_data.block_count);
-    if(!write_blocks(iso, app->nfc_data.data,
-                     app->nfc_data.block_count, app->nfc_data.block_size)) {
-        return WriteResultBlockWriteFailed;
+    WriteResult b_res = write_blocks(iso, app->nfc_data.data,
+                                     app->nfc_data.block_count, app->nfc_data.block_size);
+    if(b_res != WriteResultOk) {
+        return b_res;
     }
     FURI_LOG_I(TAG, "Blocks OK");
 
@@ -634,6 +737,12 @@ static WriteResult do_normal_write(SliWriterApp* app, Iso15693_3Poller* iso) {
  *   2. Write blocks addressed (flags=0x62) using factory UID
  *   3. Set target UID from .nfc file */
 static WriteResult do_special_write(SliWriterApp* app, Iso15693_3Poller* iso) {
+    if(app->nfc_data.block_count == 0 || app->nfc_data.block_size != 4) {
+        FURI_LOG_E(TAG, "Cannot write: invalid or incomplete NFC data");
+        furi_string_set(app->error_message, "Incomplete NFC data");
+        return WriteResultBlockWriteFailed;
+    }
+
     FURI_LOG_I(TAG, "Special write: factory=%02X%02X.. target=%02X%02X..",
                app->special_uid[0], app->special_uid[1],
                app->nfc_data.uid[0], app->nfc_data.uid[1]);
@@ -674,11 +783,12 @@ static WriteResult do_special_write(SliWriterApp* app, Iso15693_3Poller* iso) {
 
     /* Step 2: write blocks addressed using factory UID */
     FURI_LOG_I(TAG, "Step 2: write blocks addressed (0x62)");
-    if(!write_blocks_addressed(iso, app->special_uid,
-                               app->nfc_data.data,
-                               app->nfc_data.block_count,
-                               app->nfc_data.block_size)) {
-        return WriteResultBlockWriteFailed;
+    WriteResult b_res = write_blocks_addressed(iso, app->special_uid,
+                                               app->nfc_data.data,
+                                               app->nfc_data.block_count,
+                                               app->nfc_data.block_size);
+    if(b_res != WriteResultOk) {
+        return b_res;
     }
     FURI_LOG_I(TAG, "Blocks OK");
 
@@ -960,7 +1070,9 @@ void sli_writer_scene_file_select_on_enter(void* context) {
             scene_manager_next_scene(app->scene_manager, SliWriterSceneWrite);
         } else {
             app->write_result = WriteResultUnknown;
-            furi_string_set(app->error_message, "Cannot parse .nfc file");
+            if(furi_string_size(app->error_message) == 0) {
+                furi_string_set(app->error_message, "Cannot parse .nfc file");
+            }
             scene_manager_next_scene(app->scene_manager, SliWriterSceneResult);
         }
     } else {
