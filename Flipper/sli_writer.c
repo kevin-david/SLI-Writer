@@ -2,14 +2,20 @@
 // Writes Magic ISO15693 SLI / SLIX-L / Special cards from a Flipper .nfc file.
 //
 // Three write modes:
-//   Normal  — non-addressed write, then UID via 0x40/0x41
+//   Normal  — non-addressed write, then UID (auto-detects Gen3 magic or Gen2 0x40/0x41)
 //   SaveUID — inventory only, save detected UID as canonical "special (factory) UID"
 //   Special — restore factory UID, write blocks addressed (flags=0x62), set target UID
+//
+// Normal write sequence:
+//   1. write_blocks()        — standard ISO15693 WRITE_SINGLE_BLOCK (flags=0x02)
+//   2. is_gen3_magic()       — checks signature blocks 0x14 / 0x15
+//      - If Gen3: write UID into blocks 0x10 and 0x11
+//      - If Gen2: write UID via vendor commands 0x40 / 0x41
 //
 // Special card write sequence:
 //   1. magic_write_uid(factory_uid)  — restore factory UID so blocks are writable
 //   2. write_blocks_addressed()      — flags=0x62 (high rate + addressed + option)
-//   3. magic_write_uid(target_uid)   — set the UID from the .nfc file
+//   3. write target UID (Gen3 or Gen2)
 //
 // UID Byte Order:
 //   All UIDs in memory (detected_uid, special_uid, nfc_data.uid) are in canonical MSB-first order,
@@ -29,6 +35,7 @@
  *  ISO15693 / Magic command constants
  * ========================================================================== */
 
+#define ISO15693_CMD_READ_BLOCK   0x20
 #define ISO15693_CMD_WRITE_BLOCK  0x21
 #define ISO15693_CMD_READ_BLOCK   0x20
 #define ISO15693_CMD_SELECT       0x25
@@ -39,6 +46,12 @@
  *   LOW:  02 E0 09 41 uid[3..0] */
 #define SLI_MAGIC_SET_UID_HIGH  0x40
 #define SLI_MAGIC_SET_UID_LOW   0x41
+
+/* Gen3 magic UID and signature blocks (Proxmark: unfinalized Gen3 tags) */
+#define ISO15_GEN3_BLOCK_UID_LOW   0x10
+#define ISO15_GEN3_BLOCK_UID_HIGH  0x11
+#define ISO15_GEN3_BLOCK_SIG_A     0x14
+#define ISO15_GEN3_BLOCK_SIG_B     0x15
 
 /* FWT in carrier cycles — 500000 fc ≈ 37ms */
 #define ISO15693_FWT_FC  500000
@@ -257,6 +270,171 @@ static WriteResult magic_write_uid(Iso15693_3Poller* iso, const uint8_t uid_msb[
 
     FURI_LOG_E(TAG, "UID verification failed: UID mismatch");
     return WriteResultUidMismatch;
+}
+
+/* ============================================================================
+ *  ISO15693 Read Single Block helper (non-addressed, flags=0x02)
+ * ========================================================================== */
+
+static bool read_single_block(
+    Iso15693_3Poller* iso,
+    uint8_t block_number,
+    uint8_t data[4])
+{
+    uint8_t frame[3] = {0x02, ISO15693_CMD_READ_BLOCK, block_number};
+    BitBuffer* tx = bb_alloc_from(frame, sizeof(frame));
+    if(!tx) return false;
+    BitBuffer* rx = bb_alloc_rx(16);
+    if(!rx) {
+        bit_buffer_free(tx);
+        return false;
+    }
+
+    Iso15693_3Error err = iso15693_3_poller_send_frame(iso, tx, rx, ISO15693_FWT_FC);
+    bool ok = (err == Iso15693_3ErrorNone) && iso_reply_ok(rx);
+    size_t rx_bytes = bit_buffer_get_size_bytes(rx);
+
+    if(ok && rx_bytes >= 5) {
+        for(size_t i = 0; i < 4; i++) {
+            data[i] = bit_buffer_get_byte(rx, 1 + i);
+        }
+    } else {
+        ok = false;
+    }
+
+    bit_buffer_free(tx);
+    bit_buffer_free(rx);
+    return ok;
+}
+
+/* ============================================================================
+ *  Gen3 magic detection helper
+ *  Unfinalized Gen3 tags have signature:
+ *    block 0x14 = A5 2B 44 2C
+ *    block 0x15 = 21 AE 93 00
+ * ========================================================================== */
+
+static bool is_gen3_magic(Iso15693_3Poller* iso) {
+    static const uint8_t gen3_sig14[4] = {0xA5, 0x2B, 0x44, 0x2C};
+    static const uint8_t gen3_sig15[4] = {0x21, 0xAE, 0x93, 0x00};
+
+    uint8_t data14[4] = {0};
+    uint8_t data15[4] = {0};
+
+    bool ok14 = false;
+    for(int i = 0; i < 3; i++) {
+        if(read_single_block(iso, ISO15_GEN3_BLOCK_SIG_A, data14)) {
+            ok14 = true;
+            break;
+        }
+        furi_delay_ms(20);
+    }
+    if(!ok14) {
+        FURI_LOG_D(TAG, "Gen3 check: failed to read block 0x14");
+        return false;
+    }
+
+    furi_delay_ms(20);
+
+    bool ok15 = false;
+    for(int i = 0; i < 3; i++) {
+        if(read_single_block(iso, ISO15_GEN3_BLOCK_SIG_B, data15)) {
+            ok15 = true;
+            break;
+        }
+        furi_delay_ms(20);
+    }
+    if(!ok15) {
+        FURI_LOG_D(TAG, "Gen3 check: failed to read block 0x15");
+        return false;
+    }
+
+    FURI_LOG_I(
+        TAG,
+        "Gen3 check: blk14=%02X%02X%02X%02X blk15=%02X%02X%02X%02X",
+        data14[0], data14[1], data14[2], data14[3],
+        data15[0], data15[1], data15[2], data15[3]);
+
+    if(memcmp(data14, gen3_sig14, 4) == 0 &&
+       memcmp(data15, gen3_sig15, 4) == 0) {
+        return true;
+    }
+
+    return false;
+}
+
+/* ============================================================================
+ *  Gen3 magic UID write helper
+ *  Gen3 stores writable UID across blocks 0x10 and 0x11:
+ *    block 0x10 = uid[7..4]
+ *    block 0x11 = uid[3..0]
+ * ========================================================================== */
+
+static bool gen3_write_uid(Iso15693_3Poller* iso, const uint8_t uid[8]) {
+    uint8_t block10[7] = {
+        0x02,
+        ISO15693_CMD_WRITE_BLOCK,
+        ISO15_GEN3_BLOCK_UID_LOW,
+        uid[7], uid[6], uid[5], uid[4],
+    };
+
+    uint8_t block11[7] = {
+        0x02,
+        ISO15693_CMD_WRITE_BLOCK,
+        ISO15_GEN3_BLOCK_UID_HIGH,
+        uid[3], uid[2], uid[1], uid[0],
+    };
+
+    FURI_LOG_I(
+        TAG,
+        "Gen3 UID -> %02X%02X%02X%02X%02X%02X%02X%02X",
+        uid[0], uid[1], uid[2], uid[3],
+        uid[4], uid[5], uid[6], uid[7]);
+
+    bool ok = false;
+    for(int i = 0; i < 5; i++) {
+        if(iso_send_raw(iso, block10, sizeof(block10), ISO15693_FWT_FC)) {
+            ok = true;
+            break;
+        }
+        furi_delay_ms(20);
+    }
+    if(!ok) {
+        FURI_LOG_E(TAG, "Gen3 UID block 0x10 failed");
+        return false;
+    }
+
+    furi_delay_ms(20);
+
+    ok = false;
+    for(int i = 0; i < 5; i++) {
+        if(iso_send_raw(iso, block11, sizeof(block11), ISO15693_FWT_FC)) {
+            ok = true;
+            break;
+        }
+        furi_delay_ms(20);
+    }
+    if(!ok) {
+        FURI_LOG_E(TAG, "Gen3 UID block 0x11 failed");
+        return false;
+    }
+
+    /* Verification inventory */
+    furi_delay_ms(50);
+    uint8_t verify_lsb[8];
+    for(int i = 0; i < 5; i++) {
+        if(iso15693_3_poller_inventory(iso, verify_lsb) == Iso15693_3ErrorNone) {
+            FURI_LOG_I(
+                TAG,
+                "Post-write UID: %02X%02X%02X%02X%02X%02X%02X%02X",
+                verify_lsb[7], verify_lsb[6], verify_lsb[5], verify_lsb[4],
+                verify_lsb[3], verify_lsb[2], verify_lsb[1], verify_lsb[0]);
+            break;
+        }
+        furi_delay_ms(25);
+    }
+
+    return true;
 }
 
 /* ============================================================================
@@ -721,9 +899,18 @@ static WriteResult do_normal_write(SliWriterApp* app, Iso15693_3Poller* iso) {
         furi_delay_ms(20);
 
         FURI_LOG_I(TAG, "Writing target UID...");
-        WriteResult res = magic_write_uid(iso, app->nfc_data.uid);
-        if(res != WriteResultOk) {
-            return res;
+        if(is_gen3_magic(iso)) {
+            FURI_LOG_I(TAG, "Detected ISO15693 Gen3 magic tag");
+            if(!gen3_write_uid(iso, app->nfc_data.uid)) {
+                furi_string_set(app->error_message, "Gen3 UID write failed");
+                return WriteResultUidCmdFailed;
+            }
+        } else {
+            FURI_LOG_I(TAG, "Using Gen2 UID method");
+            WriteResult res = magic_write_uid(iso, app->nfc_data.uid);
+            if(res != WriteResultOk) {
+                return res;
+            }
         }
         FURI_LOG_I(TAG, "UID OK");
     } else {
@@ -808,9 +995,18 @@ static WriteResult do_special_write(SliWriterApp* app, Iso15693_3Poller* iso) {
     if(memcmp(app->nfc_data.uid, zero_uid, 8) != 0 &&
        memcmp(app->nfc_data.uid, app->special_uid, 8) != 0) {
         FURI_LOG_I(TAG, "Step 3: write target UID");
-        WriteResult res = magic_write_uid(iso, app->nfc_data.uid);
-        if(res != WriteResultOk) {
-            return res;
+        if(is_gen3_magic(iso)) {
+            FURI_LOG_I(TAG, "Detected ISO15693 Gen3 magic tag");
+            if(!gen3_write_uid(iso, app->nfc_data.uid)) {
+                furi_string_set(app->error_message, "Gen3 UID write failed");
+                return WriteResultUidCmdFailed;
+            }
+        } else {
+            FURI_LOG_I(TAG, "Using Gen2 UID method");
+            WriteResult res = magic_write_uid(iso, app->nfc_data.uid);
+            if(res != WriteResultOk) {
+                return res;
+            }
         }
         FURI_LOG_I(TAG, "Target UID OK");
     } else {

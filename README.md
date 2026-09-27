@@ -28,24 +28,41 @@ Save the original UID (usually the same if you order several tags from the same 
 
 ---
 
+### Gen3 ISO15693 Magic Tags
+
+Unfinalized Gen3 tags (with signature blocks `0x14 = A5 2B 44 2C` and `0x15 = 21 AE 93 00`) in **normal** mode.
+
+UID is automatically written to blocks `0x10` and `0x11` when Gen3 signature is detected.
+
+---
+
 ## ✍️ Write Sequence
 
 ### Normal mode
 
 #### 1. Write data blocks
-- Command: `WRITE_SINGLE_BLOCK`
+- Command: `WRITE_SINGLE_BLOCK` (`0x21`)
 - Mode: **non-addressed**
 - Flags: `0x02`
 
-#### 2. Write UID (Gen2 vendor commands)
-```
-02 E0 09 40 <uid_high>   → sets bytes 0–3
-02 E0 09 41 <uid_low>    → sets bytes 4–7
-```
-Equivalent to:
-```
-proxmark hf 15 csetuid -u <uid> --v2
-```
+#### 2. Auto-detect Magic Gen & Write UID
+The app reads signature blocks `0x14` and `0x15`:
+- **If Gen3 detected** (`0x14 == A5 2B 44 2C` and `0x15 == 21 AE 93 00`):
+  UID is written across blocks `0x10` and `0x11` using standard `WRITE_SINGLE_BLOCK`:
+  ```
+  02 21 10 <uid[7..4]>
+  02 21 11 <uid[3..0]>
+  ```
+- **Else (Gen2 fallback)**:
+  Uses Gen2 vendor commands:
+  ```
+  02 E0 09 40 <uid_high>   → sets bytes 0–3
+  02 E0 09 41 <uid_low>    → sets bytes 4–7
+  ```
+  Equivalent to:
+  ```
+  proxmark hf 15 csetuid -u <uid> --v2
+  ```
 
 ---
 
