@@ -7,4 +7,5 @@ App(
     stack_size=4096,
     order=10,
     fap_category="NFC",
+    fap_icon="sli_writer.png",
 )
