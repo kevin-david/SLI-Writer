@@ -111,15 +111,18 @@ static bool iso_send_raw(
 
 /* ============================================================================
  *  Reset card to Ready state helper
+ *  Workaround/resync for magic tags to transition from addressed block writes
+ *  back to Ready state before vendor UID commands are issued.
+ *  If expected_uid_lsb is provided, verifies that the expected card is active.
  * ========================================================================== */
 
-static bool reset_card_to_ready(Iso15693_3Poller* iso, const uint8_t uid_lsb[8]) {
+static bool reset_card_to_ready(Iso15693_3Poller* iso, const uint8_t expected_uid_lsb[8]) {
     /* 1. Addressed Reset to Ready (0x22 0x26 <UID 8 bytes LSB-first>) */
-    if(uid_lsb) {
+    if(expected_uid_lsb) {
         uint8_t frame_reset[10];
         frame_reset[0] = 0x22; /* High data rate + Addressed */
         frame_reset[1] = 0x26; /* ISO15693 RESET_TO_READY */
-        memcpy(&frame_reset[2], uid_lsb, 8);
+        memcpy(&frame_reset[2], expected_uid_lsb, 8);
         iso_send_raw(iso, frame_reset, sizeof(frame_reset), ISO15693_FWT_FC);
         furi_delay_ms(20);
     }
@@ -133,10 +136,20 @@ static bool reset_card_to_ready(Iso15693_3Poller* iso, const uint8_t uid_lsb[8])
     uint8_t resync_uid[8];
     for(int i = 0; i < 5; i++) {
         if(iso15693_3_poller_inventory(iso, resync_uid) == Iso15693_3ErrorNone) {
-            FURI_LOG_I(TAG, "Card reset to ready, UID: %02X%02X%02X%02X%02X%02X%02X%02X",
-                       resync_uid[7], resync_uid[6], resync_uid[5], resync_uid[4],
-                       resync_uid[3], resync_uid[2], resync_uid[1], resync_uid[0]);
-            return true;
+            if(expected_uid_lsb) {
+                if(memcmp(resync_uid, expected_uid_lsb, 8) == 0) {
+                    FURI_LOG_I(TAG, "Card reset to ready and verified UID: %02X%02X%02X%02X%02X%02X%02X%02X",
+                               resync_uid[7], resync_uid[6], resync_uid[5], resync_uid[4],
+                               resync_uid[3], resync_uid[2], resync_uid[1], resync_uid[0]);
+                    return true;
+                }
+                FURI_LOG_W(TAG, "Card reset to ready: UID mismatch, retrying resync...");
+            } else {
+                FURI_LOG_I(TAG, "Card reset to ready, UID: %02X%02X%02X%02X%02X%02X%02X%02X",
+                           resync_uid[7], resync_uid[6], resync_uid[5], resync_uid[4],
+                           resync_uid[3], resync_uid[2], resync_uid[1], resync_uid[0]);
+                return true;
+            }
         }
         furi_delay_ms(25);
     }
@@ -162,37 +175,79 @@ static bool magic_write_uid(Iso15693_3Poller* iso, const uint8_t uid_msb[8]) {
 
     FURI_LOG_I(TAG, "magic_write_uid HIGH: %02X%02X%02X%02X",
                uid_msb[0], uid_msb[1], uid_msb[2], uid_msb[3]);
-    bool ok = false;
+    bool ok_high = false;
     for(int i = 0; i < 5; i++) {
-        if(iso_send_raw(iso, frame_high, sizeof(frame_high), 1000000)) { ok = true; break; }
+        if(iso_send_raw(iso, frame_high, sizeof(frame_high), 1000000)) {
+            ok_high = true;
+            break;
+        }
         furi_delay_ms(25);
+        /* Check if write took effect despite timeout/ACK failure */
+        uint8_t check_uid[8];
+        if(iso15693_3_poller_inventory(iso, check_uid) == Iso15693_3ErrorNone) {
+            if(memcmp(&check_uid[0], &frame_high[4], 4) == 0) {
+                FURI_LOG_I(TAG, "SET_UID_HIGH verified via inventory despite no ACK");
+                ok_high = true;
+                break;
+            }
+        }
     }
-    if(!ok) { FURI_LOG_E(TAG, "SET_UID_HIGH failed"); return false; }
+    if(!ok_high) { FURI_LOG_E(TAG, "SET_UID_HIGH failed"); return false; }
     furi_delay_ms(50);
 
     FURI_LOG_I(TAG, "magic_write_uid LOW:  %02X%02X%02X%02X",
                uid_msb[4], uid_msb[5], uid_msb[6], uid_msb[7]);
-    ok = false;
+    bool ok_low = false;
     for(int i = 0; i < 5; i++) {
-        if(iso_send_raw(iso, frame_low, sizeof(frame_low), 1000000)) { ok = true; break; }
+        if(iso_send_raw(iso, frame_low, sizeof(frame_low), 1000000)) {
+            ok_low = true;
+            break;
+        }
         furi_delay_ms(25);
+        /* Check if write took effect despite timeout/ACK failure */
+        uint8_t check_uid[8];
+        if(iso15693_3_poller_inventory(iso, check_uid) == Iso15693_3ErrorNone) {
+            if(memcmp(&check_uid[4], &frame_low[4], 4) == 0) {
+                FURI_LOG_I(TAG, "SET_UID_LOW verified via inventory despite no ACK");
+                ok_low = true;
+                break;
+            }
+        }
     }
-    if(!ok) { FURI_LOG_E(TAG, "SET_UID_LOW failed"); return false; }
+    if(!ok_low) { FURI_LOG_E(TAG, "SET_UID_LOW failed"); return false; }
 
-    /* Verification inventory */
+    /* Strict verification inventory */
     furi_delay_ms(50);
     uint8_t verify_lsb[8];
+    bool verified = false;
+
     for(int i = 0; i < 5; i++) {
         if(iso15693_3_poller_inventory(iso, verify_lsb) == Iso15693_3ErrorNone) {
-            FURI_LOG_I(TAG, "Post-write UID: %02X%02X%02X%02X%02X%02X%02X%02X",
-                       verify_lsb[7], verify_lsb[6], verify_lsb[5], verify_lsb[4],
-                       verify_lsb[3], verify_lsb[2], verify_lsb[1], verify_lsb[0]);
-            break;
+            uint8_t verify_msb[8];
+            for(int j = 0; j < 8; j++) {
+                verify_msb[j] = verify_lsb[7 - j];
+            }
+
+            if(memcmp(verify_msb, uid_msb, 8) == 0) {
+                FURI_LOG_I(TAG, "Post-write UID verified: %02X%02X%02X%02X%02X%02X%02X%02X",
+                           verify_msb[0], verify_msb[1], verify_msb[2], verify_msb[3],
+                           verify_msb[4], verify_msb[5], verify_msb[6], verify_msb[7]);
+                verified = true;
+                break;
+            }
+
+            FURI_LOG_W(TAG, "UID mismatch after write: got %02X%02X%02X%02X%02X%02X%02X%02X",
+                       verify_msb[0], verify_msb[1], verify_msb[2], verify_msb[3],
+                       verify_msb[4], verify_msb[5], verify_msb[6], verify_msb[7]);
         }
         furi_delay_ms(25);
     }
 
-    return true;
+    if(!verified) {
+        FURI_LOG_E(TAG, "magic_write_uid verification failed: target UID not verified");
+    }
+
+    return verified;
 }
 
 /* ============================================================================
@@ -263,6 +318,56 @@ static bool write_blocks(
  *  We ignore no-response errors and only fail on explicit card error flag.
  * ========================================================================== */
 
+/* ============================================================================
+ *  Special block read helper (addressed, flags=0x22)
+ * ========================================================================== */
+
+static bool read_block_addressed(
+    Iso15693_3Poller* iso,
+    const uint8_t uid_lsb[8],
+    uint8_t block_number,
+    uint8_t data[4])
+{
+    uint8_t frame[11];
+    frame[0] = 0x22; /* High data rate + Addressed */
+    frame[1] = 0x20; /* ISO15693 READ_SINGLE_BLOCK */
+    memcpy(&frame[2], uid_lsb, 8);
+    frame[10] = block_number;
+
+    BitBuffer* tx = bb_alloc_from(frame, sizeof(frame));
+    if(!tx) return false;
+    BitBuffer* rx = bb_alloc_rx(16);
+    if(!rx) {
+        bit_buffer_free(tx);
+        return false;
+    }
+
+    Iso15693_3Error err = iso15693_3_poller_send_frame(iso, tx, rx, ISO15693_FWT_FC);
+    bool ok = (err == Iso15693_3ErrorNone) && iso_reply_ok(rx);
+    size_t rxsz = bit_buffer_get_size_bytes(rx);
+
+    if(ok && rxsz >= 5) {
+        for(size_t i = 0; i < 4; i++) {
+            data[i] = bit_buffer_get_byte(rx, 1 + i);
+        }
+    } else {
+        ok = false;
+    }
+
+    bit_buffer_free(tx);
+    bit_buffer_free(rx);
+    return ok;
+}
+
+/* ============================================================================
+ *  Special block write (addressed + option, flags=0x62)
+ *  flags=0x62: high data rate(0x02) + addressed(0x20) + option(0x40)
+ *
+ *  With Option flag, NXP cards use 2-phase response — timeout is normal.
+ *  After writing all blocks, every block is read back and strictly verified
+ *  byte-for-byte against source data before proceeding.
+ * ========================================================================== */
+
 static bool write_blocks_addressed(
     Iso15693_3Poller* iso,
     const uint8_t uid_lsb[8],
@@ -312,10 +417,48 @@ static bool write_blocks_addressed(
             FURI_LOG_E(TAG, "Block %u: card error", (unsigned)b);
             return false;
         }
-        /* err=6/timeout with rxbytes=0 is normal with option flag — continue */
 
         furi_delay_ms(25);
     }
+
+    /* Strict read-back verification: read every written block back and verify */
+    FURI_LOG_I(TAG, "Verifying %u written blocks...", (unsigned)blocks);
+    furi_delay_ms(30);
+
+    for(size_t b = 0; b < blocks; b++) {
+        uint8_t readback[4] = {0};
+        bool verified_block = false;
+
+        for(int attempt = 0; attempt < 5; attempt++) {
+            if(read_block_addressed(iso, uid_lsb, (uint8_t)b, readback)) {
+                if(memcmp(readback, &data[b * block_size], block_size) == 0) {
+                    verified_block = true;
+                    break;
+                }
+                FURI_LOG_W(
+                    TAG,
+                    "Block %u readback mismatch (attempt %d): [%02X %02X %02X %02X] != [%02X %02X %02X %02X]",
+                    (unsigned)b,
+                    attempt,
+                    readback[0],
+                    readback[1],
+                    readback[2],
+                    readback[3],
+                    data[b * block_size],
+                    data[b * block_size + 1],
+                    data[b * block_size + 2],
+                    data[b * block_size + 3]);
+            }
+            furi_delay_ms(20);
+        }
+
+        if(!verified_block) {
+            FURI_LOG_E(TAG, "Block %u readback verification failed!", (unsigned)b);
+            return false;
+        }
+    }
+
+    FURI_LOG_I(TAG, "All %u blocks verified successfully!", (unsigned)blocks);
     return true;
 }
 
@@ -378,43 +521,78 @@ bool sli_writer_parse_nfc_file(SliWriterApp* app, const char* path) {
             buf[n] = '\0';
 
             memset(&app->nfc_data, 0x00, sizeof(app->nfc_data));
-            app->nfc_data.block_size  = 4;
+            app->nfc_data.block_size  = 0;
             app->nfc_data.block_count = 0;
 
             char* p;
+            size_t uid_count = 0;
 
             if((p = strstr(buf, "UID: "))) {
                 p += 5;
                 char* q = p;
                 for(int i = 0; i < 8; i++) {
                     while(*q == ' ') q++;
-                    app->nfc_data.uid[i] = (uint8_t)strtol(q, &q, 16);
+                    char* end = NULL;
+                    long val = strtol(q, &end, 16);
+                    if(end == q || val < 0 || val > 0xFF) break;
+                    app->nfc_data.uid[i] = (uint8_t)val;
+                    q = end;
+                    uid_count++;
                 }
 
-                if((p = strstr(buf, "Block Count: ")))
+                if((p = strstr(buf, "Block Count: "))) {
                     sscanf(p + 13, "%hhu", &app->nfc_data.block_count);
+                }
 
-                if((p = strstr(buf, "Block Size: ")))
+                if((p = strstr(buf, "Block Size: "))) {
                     sscanf(p + 12, "%hhu", &app->nfc_data.block_size);
+                }
 
-                if((p = strstr(buf, "Data Content: "))) {
-                    p += 14;
-                    size_t total = (size_t)app->nfc_data.block_count * app->nfc_data.block_size;
-                    if(total > sizeof(app->nfc_data.data)) total = sizeof(app->nfc_data.data);
-                    char* q2 = p;
-                    for(size_t i = 0; i < total; i++) {
-                        while(*q2 == ' ') q2++;
-                        app->nfc_data.data[i] = (uint8_t)strtol(q2, &q2, 16);
+                size_t data_bytes_parsed = 0;
+                size_t expected_total = (size_t)app->nfc_data.block_count * app->nfc_data.block_size;
+
+                if(expected_total > 0 && expected_total <= sizeof(app->nfc_data.data)) {
+                    if((p = strstr(buf, "Data Content: "))) {
+                        p += 14;
+                        char* q2 = p;
+                        for(size_t i = 0; i < expected_total; i++) {
+                            while(*q2 == ' ' || *q2 == '\r' || *q2 == '\n') q2++;
+                            char* end2 = NULL;
+                            long val = strtol(q2, &end2, 16);
+                            if(end2 == q2 || val < 0 || val > 0xFF) break;
+                            app->nfc_data.data[i] = (uint8_t)val;
+                            q2 = end2;
+                            data_bytes_parsed++;
+                        }
                     }
                 }
 
-                FURI_LOG_I(TAG, "Parsed: blocks=%u size=%u uid=%02X%02X%02X%02X%02X%02X%02X%02X",
-                           app->nfc_data.block_count, app->nfc_data.block_size,
-                           app->nfc_data.uid[0], app->nfc_data.uid[1],
-                           app->nfc_data.uid[2], app->nfc_data.uid[3],
-                           app->nfc_data.uid[4], app->nfc_data.uid[5],
-                           app->nfc_data.uid[6], app->nfc_data.uid[7]);
-                ok = true;
+                /* Validation:
+                 * - Exact 8-byte UID
+                 * - block_count > 0 and <= SLI_MAGIC_MAX_BLOCKS
+                 * - block_size == 4
+                 * - Data Content contains exactly block_count * block_size valid bytes
+                 */
+                if(uid_count == 8 &&
+                   app->nfc_data.block_count > 0 &&
+                   app->nfc_data.block_count <= SLI_MAGIC_MAX_BLOCKS &&
+                   app->nfc_data.block_size == 4 &&
+                   data_bytes_parsed == expected_total) {
+                    FURI_LOG_I(TAG, "Parsed valid .nfc: blocks=%u size=%u uid=%02X%02X%02X%02X%02X%02X%02X%02X",
+                               app->nfc_data.block_count, app->nfc_data.block_size,
+                               app->nfc_data.uid[0], app->nfc_data.uid[1],
+                               app->nfc_data.uid[2], app->nfc_data.uid[3],
+                               app->nfc_data.uid[4], app->nfc_data.uid[5],
+                               app->nfc_data.uid[6], app->nfc_data.uid[7]);
+                    ok = true;
+                } else {
+                    FURI_LOG_E(TAG, "Invalid .nfc file: uid_count=%u blocks=%u size=%u data_bytes=%u/%u",
+                               (unsigned)uid_count,
+                               (unsigned)app->nfc_data.block_count,
+                               (unsigned)app->nfc_data.block_size,
+                               (unsigned)data_bytes_parsed,
+                               (unsigned)expected_total);
+                }
             }
             free(buf);
         }
@@ -489,20 +667,29 @@ static bool do_special_write(SliWriterApp* app, Iso15693_3Poller* iso) {
         furi_delay_ms(50);
     } /* let card settle after UID change */
 
-    /* RF resync only needed if we actually changed the UID */
-    if(!already_factory) {
-        furi_delay_ms(50);
-        uint8_t uid_resync[8];
-        Iso15693_3Error resync_err = iso15693_3_poller_inventory(iso, uid_resync);
-        FURI_LOG_I(TAG, "Resync inventory: err=%d uid=%02X%02X%02X%02X%02X%02X%02X%02X",
-                   (int)resync_err,
-                   uid_resync[7], uid_resync[6], uid_resync[5], uid_resync[4],
-                   uid_resync[3], uid_resync[2], uid_resync[1], uid_resync[0]);
-        if(resync_err != Iso15693_3ErrorNone) {
-            furi_string_set(app->error_message, "Card lost after UID restore");
-            return false;
+    /* Require inventoried UID == factory_uid_msb before allowing any block writes */
+    furi_delay_ms(50);
+    uint8_t uid_resync[8];
+    bool factory_uid_verified = false;
+    for(int i = 0; i < 5; i++) {
+        if(iso15693_3_poller_inventory(iso, uid_resync) == Iso15693_3ErrorNone) {
+            uint8_t uid_resync_msb[8];
+            for(int j = 0; j < 8; j++) uid_resync_msb[j] = uid_resync[7 - j];
+
+            if(memcmp(uid_resync_msb, factory_uid_msb, 8) == 0) {
+                factory_uid_verified = true;
+                break;
+            }
+            FURI_LOG_W(TAG, "Factory UID mismatch in resync: expected %02X.. got %02X..",
+                       factory_uid_msb[0], uid_resync_msb[0]);
         }
-        furi_delay_ms(20);
+        furi_delay_ms(25);
+    }
+
+    if(!factory_uid_verified) {
+        FURI_LOG_E(TAG, "Card does not have factory UID active; aborting Special write");
+        furi_string_set(app->error_message, "Factory UID mismatch");
+        return false;
     }
 
     /* Step 2: write blocks addressed using factory UID */
@@ -519,10 +706,10 @@ static bool do_special_write(SliWriterApp* app, Iso15693_3Poller* iso) {
     /* Wait for card EEPROM write to settle after block writes */
     furi_delay_ms(100);
 
-    /* Reset card out of Addressed state back into Ready state before UID write */
-    FURI_LOG_I(TAG, "Resetting card to ready state before UID write...");
+    /* Resynchronize card to Ready state before vendor UID commands */
+    FURI_LOG_I(TAG, "Resynchronizing card to ready state before UID write...");
     if(!reset_card_to_ready(iso, app->special_uid)) {
-        FURI_LOG_E(TAG, "Card not responding after block write");
+        FURI_LOG_E(TAG, "Card not responding or UID mismatch after block write");
         furi_string_set(app->error_message, "Card lost before UID write");
         return false;
     }
