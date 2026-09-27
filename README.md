@@ -40,33 +40,35 @@ UID is automatically written to blocks `0x10` and `0x11` when Gen3 signature is 
 
 ### Normal mode
 
-#### 1. Write data blocks
-- Command: `WRITE_SINGLE_BLOCK` (`0x21`)
-- Mode: **non-addressed**
-- Flags: `0x02`
+#### 1. Pre-Write Safety & Auto-Detection
+Before issuing any write commands, the app performs a tri-state check on signature blocks `0x14` and `0x15`:
+- **`GEN3_UNKNOWN`**: If either block cannot be reliably read due to RF loss/timeouts, the write is immediately aborted to prevent bricking.
+- **`GEN3_YES` (`0x14 == A5 2B 44 2C` and `0x15 == 21 AE 93 00`)**:
+  - Validates source `.nfc` layout: strictly requires 8 blocks × 4 bytes and UID starting with `E0 04 03` (Tonie layout) to prevent overwriting vendor blocks.
+- **`GEN3_NO`**: Standard / Gen2 ISO15693 tag.
 
-#### 2. Auto-detect Magic Gen & Write UID
-The app reads signature blocks `0x14` and `0x15`:
-- **If Gen3 detected** (`0x14 == A5 2B 44 2C` and `0x15 == 21 AE 93 00`):
-  UID is written across blocks `0x10` and `0x11` using standard `WRITE_SINGLE_BLOCK`:
-  ```
-  02 21 10 <uid[7..4]>
-  02 21 11 <uid[3..0]>
-  ```
-- **Else (Gen2 fallback)**:
+#### 2. Write Data Blocks
+- Command: `WRITE_SINGLE_BLOCK` (`0x21`), non-addressed, flags `0x02` (clamped to max 8 blocks on Gen3).
+
+#### 3. Write & Verify UID
+- **Gen3**:
+  1. Re-verifies signature blocks `0x14` and `0x15` to ensure they were never altered by block writes.
+  2. Writes block `0x10` (`<uid[7..4]>`) and reads back to verify.
+  3. Writes block `0x11` (`<uid[3..0]>`) and reads back to verify.
+  4. Runs inventory and strictly compares the reported UID against the target UID.
+- **Gen2 Fallback**:
   Uses Gen2 vendor commands:
   ```
   02 E0 09 40 <uid_high>   → sets bytes 0–3
   02 E0 09 41 <uid_low>    → sets bytes 4–7
   ```
-  Equivalent to:
-  ```
-  proxmark hf 15 csetuid -u <uid> --v2
-  ```
+  Equivalent to `proxmark hf 15 csetuid -u <uid> --v2`.
 
 ---
 
 ### Special mode (TAG-it TI2048 / AliExpress batch)
+
+> ℹ️ **Gen3 tags do not use Special mode.** Special mode automatically detects Gen3 tags at entry and aborts with `"Gen3: use Normal write"` to protect the tag.
 
 These tags require the original factory UID to be present before data blocks can be written.
 
