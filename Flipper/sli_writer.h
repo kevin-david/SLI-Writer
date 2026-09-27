@@ -16,7 +16,6 @@
 #include <gui/view_dispatcher.h>
 #include <gui/modules/submenu.h>
 #include <gui/modules/dialog_ex.h>
-#include <gui/modules/loading.h>
 #include <gui/scene_manager.h>
 
 #include <dialogs/dialogs.h>
@@ -60,6 +59,7 @@ typedef enum {
     WriteResultUidReadbackUnavailable,
     WriteResultUidMismatch,
     WriteResultSaveUidFailed,
+    WriteResultGen3UidPartial,
     WriteResultUnknown,
 } WriteResult;
 
@@ -82,8 +82,13 @@ typedef enum {
 typedef enum {
     SliWriterViewSubmenu = 0,
     SliWriterViewDialogEx,
-    SliWriterViewLoading,
 } SliWriterView;
+
+typedef enum {
+    SliWriterWorkerStateIdle = 0,
+    SliWriterWorkerStateWriting,
+    SliWriterWorkerStateStopping,
+} SliWriterWorkerState;
 
 typedef enum {
     SliWriterSubmenuIndexWrite      = 0,  /* "Write NFC File"       */
@@ -122,7 +127,6 @@ typedef struct {
     SceneManager*    scene_manager;
     Submenu*         submenu;
     DialogEx*        dialog_ex;
-    Loading*         loading;
 
     /* FS & dialogs */
     Storage*         storage;
@@ -134,17 +138,15 @@ typedef struct {
 
     /* NFC */
     Nfc*             nfc;
-    bool             nfc_started;
     NfcPoller*       poller;
 
     /* Write mode & execution state */
     SliWriterMode    write_mode;
     WriteResult      write_result;
-    bool             is_writing;
+    volatile SliWriterWorkerState worker_state;
 
     /* State */
     bool             in_about;
-    bool             have_uid;
     uint8_t          detected_uid[8];   /* UID of card currently in field (canonical MSB-first) */
 
     /* Special (factory) UID — persisted to SD card (canonical MSB-first) */
@@ -164,7 +166,7 @@ void          sli_writer_app_free(SliWriterApp* app);
 
 bool sli_writer_parse_nfc_file(SliWriterApp* app, const char* file_path);
 bool sli_writer_load_special_uid(SliWriterApp* app);
-bool sli_writer_save_special_uid(SliWriterApp* app);
+bool sli_writer_save_special_uid(SliWriterApp* app, const uint8_t candidate_uid[8]);
 
 void sli_writer_submenu_callback(void* context, uint32_t index);
 void sli_writer_dialog_ex_callback(DialogExResult result, void* context);

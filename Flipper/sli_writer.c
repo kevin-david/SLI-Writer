@@ -2,14 +2,26 @@
 // Writes Magic ISO15693 SLI / SLIX-L / Special cards from a Flipper .nfc file.
 //
 // Three write modes:
-//   Normal  — non-addressed write, then UID via 0x40/0x41
+//   Normal  — non-addressed write, then UID (auto-detects Gen3 magic or Gen2 0x40/0x41)
 //   SaveUID — inventory only, save detected UID as canonical "special (factory) UID"
 //   Special — restore factory UID, write blocks addressed (flags=0x62), set target UID
 //
-// Special card write sequence:
+// Normal write sequence:
+//   1. detect_gen3()         — tri-state check before any writes (blocks 0x14 / 0x15)
+//      - If GEN3_UNKNOWN: refuse write to prevent bricking
+//      - If GEN3_YES: sanity-check source layout (8x4, UID E0 04 03...)
+//   2. write_blocks()        — standard ISO15693 WRITE_SINGLE_BLOCK (flags=0x02, max 8 on Gen3)
+//   3. If Gen3:
+//      - detect_gen3() again — verify signature blocks 0x14/0x15 are STILL intact
+//      - gen3_write_uid()    — write 0x10/0x11 with read-back comparison & inventory verification
+//      If Gen2:
+//      - magic_write_uid()   — write UID via vendor commands 0x40 / 0x41
+//
+// Special card write sequence (Gen2 only):
+//   0. detect_gen3()                 — immediately refuse if Gen3 tag detected
 //   1. magic_write_uid(factory_uid)  — restore factory UID so blocks are writable
 //   2. write_blocks_addressed()      — flags=0x62 (high rate + addressed + option)
-//   3. magic_write_uid(target_uid)   — set the UID from the .nfc file
+//   3. magic_write_uid(target_uid)   — set target UID
 //
 // UID Byte Order:
 //   All UIDs in memory (detected_uid, special_uid, nfc_data.uid) are in canonical MSB-first order,
@@ -29,6 +41,7 @@
  *  ISO15693 / Magic command constants
  * ========================================================================== */
 
+#define ISO15693_CMD_READ_BLOCK   0x20
 #define ISO15693_CMD_WRITE_BLOCK  0x21
 #define ISO15693_CMD_READ_BLOCK   0x20
 #define ISO15693_CMD_SELECT       0x25
@@ -40,8 +53,19 @@
 #define SLI_MAGIC_SET_UID_HIGH  0x40
 #define SLI_MAGIC_SET_UID_LOW   0x41
 
+/* Gen3 magic UID and signature blocks (Proxmark: unfinalized Gen3 tags) */
+#define ISO15_GEN3_BLOCK_UID_LOW   0x10
+#define ISO15_GEN3_BLOCK_UID_HIGH  0x11
+#define ISO15_GEN3_BLOCK_SIG_A     0x14
+#define ISO15_GEN3_BLOCK_SIG_B     0x15
+
 /* FWT in carrier cycles — 500000 fc ≈ 37ms */
-#define ISO15693_FWT_FC  500000
+#define ISO15693_FWT_FC            500000
+
+/* Retry and timing constants */
+#define SLI_BLOCK_WRITE_RETRIES    5
+#define SLI_BLOCK_READ_RETRIES     2
+#define SLI_EEPROM_WRITE_DELAY_MS  20
 
 /* ============================================================================
  *  LED notification sequences
@@ -73,7 +97,7 @@ static void append_uid_wire_order(BitBuffer* tx, const uint8_t uid_msb[8]) {
 }
 
 static BitBuffer* bb_alloc_from(const uint8_t* data, size_t len) {
-    BitBuffer* bb = bit_buffer_alloc(len * 8);
+    BitBuffer* bb = bit_buffer_alloc(len);
     if(!bb) return NULL;
     bit_buffer_reset(bb);
     if(data && len) bit_buffer_append_bytes(bb, data, len);
@@ -81,7 +105,7 @@ static BitBuffer* bb_alloc_from(const uint8_t* data, size_t len) {
 }
 
 static BitBuffer* bb_alloc_rx(size_t max_bytes) {
-    BitBuffer* bb = bit_buffer_alloc(max_bytes * 8);
+    BitBuffer* bb = bit_buffer_alloc(max_bytes);
     if(!bb) return NULL;
     bit_buffer_set_size(bb, 0);
     return bb;
@@ -134,7 +158,7 @@ static bool iso_send_raw(
 static bool reset_card_to_ready(Iso15693_3Poller* iso, const uint8_t expected_uid_msb[8]) {
     /* 1. Addressed Reset to Ready (0x22 0x26 <UID 8 bytes wire order>) */
     if(expected_uid_msb) {
-        BitBuffer* tx = bit_buffer_alloc(10 * 8);
+        BitBuffer* tx = bit_buffer_alloc(10);
         if(tx) {
             bit_buffer_append_byte(tx, 0x22); /* High data rate + Addressed */
             bit_buffer_append_byte(tx, ISO15693_CMD_RESET_READY);
@@ -260,11 +284,290 @@ static WriteResult magic_write_uid(Iso15693_3Poller* iso, const uint8_t uid_msb[
 }
 
 /* ============================================================================
+ *  ISO15693 Read Single Block helper (non-addressed, flags=0x02)
+ * ========================================================================== */
+
+typedef enum {
+    BlockReadOk = 0,
+    BlockReadUnsupported, /* Card answered with ISO15693 error: block not available (0x10) or command not supported (0x01/0x02) */
+    BlockReadCardError,   /* Other card error response */
+    BlockReadCommError,   /* Timeout, RF lost, collision, or malformed/truncated response */
+} BlockReadResult;
+
+typedef enum {
+    GEN3_NO = 0,
+    GEN3_YES,
+    GEN3_UNKNOWN,
+} Gen3Detection;
+
+static BlockReadResult read_single_block(
+    Iso15693_3Poller* iso,
+    const uint8_t uid_msb[8],
+    uint8_t block_number,
+    uint8_t data[4])
+{
+    BlockReadResult result = BlockReadCommError;
+
+    for(int attempt = 0; attempt < SLI_BLOCK_READ_RETRIES; attempt++) {
+        BitBuffer* tx = NULL;
+        if(uid_msb) {
+            tx = bit_buffer_alloc(11);
+            if(!tx) return BlockReadCommError;
+            bit_buffer_append_byte(tx, 0x22); /* High data rate + Addressed */
+            bit_buffer_append_byte(tx, ISO15693_CMD_READ_BLOCK);
+            append_uid_wire_order(tx, uid_msb);
+            bit_buffer_append_byte(tx, block_number);
+        } else {
+            uint8_t frame[3] = {0x02, ISO15693_CMD_READ_BLOCK, block_number};
+            tx = bb_alloc_from(frame, sizeof(frame));
+            if(!tx) return BlockReadCommError;
+        }
+
+        BitBuffer* rx = bb_alloc_rx(16);
+        if(!rx) {
+            bit_buffer_free(tx);
+            return BlockReadCommError;
+        }
+
+        Iso15693_3Error err = iso15693_3_poller_send_frame(iso, tx, rx, ISO15693_FWT_FC);
+        size_t rx_bits = bit_buffer_get_size(rx);
+        size_t rx_bytes = bit_buffer_get_size_bytes(rx);
+
+        if(err == Iso15693_3ErrorNone && rx_bytes >= 1) {
+            uint8_t flags = bit_buffer_get_byte(rx, 0);
+            if(flags & 0x01) {
+                /* ISO15693 error response: flags byte + 1 byte error code (exactly 16 bits) */
+                if(rx_bits == 16 && rx_bytes == 2) {
+                    uint8_t error_code = bit_buffer_get_byte(rx, 1);
+                    if(error_code == 0x10 || error_code == 0x01 || error_code == 0x02) {
+                        result = BlockReadUnsupported;
+                    } else {
+                        FURI_LOG_W(TAG, "Block %u card error code: 0x%02X", block_number, error_code);
+                        result = BlockReadCardError;
+                    }
+                } else {
+                    FURI_LOG_W(TAG, "Block %u malformed error frame (%u bits, %u bytes)",
+                               block_number, (unsigned)rx_bits, (unsigned)rx_bytes);
+                    result = BlockReadCommError;
+                }
+                bit_buffer_free(tx);
+                bit_buffer_free(rx);
+                break;
+            } else if(rx_bits == 40 && rx_bytes == 5) {
+                /* Valid read: exactly 1 flags byte + 4 data bytes (40 bits) */
+                for(size_t i = 0; i < 4; i++) {
+                    data[i] = bit_buffer_get_byte(rx, 1 + i);
+                }
+                result = BlockReadOk;
+                bit_buffer_free(tx);
+                bit_buffer_free(rx);
+                break;
+            } else {
+                FURI_LOG_W(TAG, "Block %u unexpected frame size (%u bits, %u bytes)",
+                           block_number, (unsigned)rx_bits, (unsigned)rx_bytes);
+                result = BlockReadCommError;
+            }
+        }
+
+        bit_buffer_free(tx);
+        bit_buffer_free(rx);
+        result = BlockReadCommError;
+        if(attempt + 1 < SLI_BLOCK_READ_RETRIES) {
+            furi_delay_ms(15);
+        }
+    }
+
+    return result;
+}
+
+/* ============================================================================
+ *  Gen3 magic detection helper (tri-state)
+ *  Unfinalized Gen3 tags have signature:
+ *    block 0x14 = A5 2B 44 2C
+ *    block 0x15 = 21 AE 93 00
+ * ========================================================================== */
+
+static Gen3Detection detect_gen3(Iso15693_3Poller* iso) {
+    static const uint8_t gen3_sig14[4] = {0xA5, 0x2B, 0x44, 0x2C};
+    static const uint8_t gen3_sig15[4] = {0x21, 0xAE, 0x93, 0x00};
+
+    uint8_t data14[4] = {0};
+    uint8_t data15[4] = {0};
+
+    BlockReadResult res14 = read_single_block(iso, NULL, ISO15_GEN3_BLOCK_SIG_A, data14);
+    if(res14 == BlockReadCommError || res14 == BlockReadCardError) {
+        FURI_LOG_W(TAG, "detect_gen3: error reading block 0x14 (res=%d)", (int)res14);
+        return GEN3_UNKNOWN;
+    }
+
+    furi_delay_ms(15);
+
+    BlockReadResult res15 = read_single_block(iso, NULL, ISO15_GEN3_BLOCK_SIG_B, data15);
+    if(res15 == BlockReadCommError || res15 == BlockReadCardError) {
+        FURI_LOG_W(TAG, "detect_gen3: error reading block 0x15 (res=%d)", (int)res15);
+        return GEN3_UNKNOWN;
+    }
+
+    bool sig14_match = (res14 == BlockReadOk && memcmp(data14, gen3_sig14, 4) == 0);
+    bool sig15_match = (res15 == BlockReadOk && memcmp(data15, gen3_sig15, 4) == 0);
+
+    /* 1. Genuine unfinalized Gen3 tag: both signatures match */
+    if(sig14_match && sig15_match) {
+        FURI_LOG_I(TAG, "detect_gen3: both signature blocks match Gen3 magic tag");
+        return GEN3_YES;
+    }
+
+    /* 2. Partial match: one signature matches but the other does not -> suspicious */
+    if(sig14_match || sig15_match) {
+        FURI_LOG_W(TAG, "detect_gen3: partial Gen3 signature match (blk14=%d, blk15=%d) -> UNKNOWN",
+                   sig14_match, sig15_match);
+        return GEN3_UNKNOWN;
+    }
+
+    /* 3. If both blocks returned Unsupported (e.g. block not available 0x10),
+     * the tag does not have memory at blocks 0x14/0x15 (standard small memory tag like 8-block SLIX) */
+    if(res14 == BlockReadUnsupported && res15 == BlockReadUnsupported) {
+        FURI_LOG_D(TAG, "detect_gen3: signature blocks unsupported; standard/Gen2 tag");
+        return GEN3_NO;
+    }
+
+    /* 4. Blocks 0x14/0x15 are readable but don't match unfinalized Gen3 signature.
+     * Check system info: if tag reports memory >= 80 blocks, or if system info query fails / is missing memory,
+     * fail safely (GEN3_UNKNOWN) rather than treating as Gen2 to prevent bricking finalized Gen3 tags. */
+    Iso15693_3SystemInfo sys_info;
+    Iso15693_3Error sys_err = iso15693_3_poller_get_system_info(iso, &sys_info);
+    if(sys_err == Iso15693_3ErrorNone) {
+        if((sys_info.flags & ISO15693_3_SYSINFO_FLAG_MEMORY)) {
+            if(sys_info.block_count >= 80) {
+                FURI_LOG_E(
+                    TAG,
+                    "Suspicious tag: %u blocks reported, but Gen3 signature altered/finalized!",
+                    sys_info.block_count);
+                return GEN3_UNKNOWN;
+            }
+            if(sys_info.block_count <= 8) {
+                return GEN3_NO;
+            }
+        }
+        /* Memory flag absent or unexpected block count -> suspicious */
+        return GEN3_UNKNOWN;
+    } else {
+        FURI_LOG_W(TAG, "detect_gen3: system info query failed (err=%d)", (int)sys_err);
+        return GEN3_UNKNOWN;
+    }
+}
+
+/* Helper to write and verify a single block with bounded retry budget */
+static bool write_single_block_verified(
+    Iso15693_3Poller* iso,
+    uint8_t block_number,
+    const uint8_t data[4],
+    uint8_t readback_out[4])
+{
+    uint8_t wframe[7] = {
+        0x02,
+        ISO15693_CMD_WRITE_BLOCK,
+        block_number,
+        data[0], data[1], data[2], data[3],
+    };
+
+    for(int attempt = 0; attempt < SLI_BLOCK_WRITE_RETRIES; attempt++) {
+        iso_send_raw(iso, wframe, sizeof(wframe), ISO15693_FWT_FC);
+        furi_delay_ms(SLI_EEPROM_WRITE_DELAY_MS);
+
+        if(read_single_block(iso, NULL, block_number, readback_out) == BlockReadOk) {
+            if(memcmp(readback_out, data, 4) == 0) {
+                return true;
+            }
+        }
+        if(attempt + 1 < SLI_BLOCK_WRITE_RETRIES) {
+            furi_delay_ms(15);
+        }
+    }
+
+    return false;
+}
+
+/* ============================================================================
+ *  Gen3 magic UID write helper with read-back verification
+ *  Gen3 stores writable UID across blocks 0x10 and 0x11:
+ *    block 0x10 = uid[7..4]
+ *    block 0x11 = uid[3..0]
+ * ========================================================================== */
+
+static WriteResult gen3_write_uid(Iso15693_3Poller* iso, const uint8_t uid[8]) {
+    const uint8_t expected_10[4] = {uid[7], uid[6], uid[5], uid[4]};
+    const uint8_t expected_11[4] = {uid[3], uid[2], uid[1], uid[0]};
+
+    FURI_LOG_I(
+        TAG,
+        "Gen3 UID write -> %02X%02X%02X%02X%02X%02X%02X%02X",
+        uid[0], uid[1], uid[2], uid[3],
+        uid[4], uid[5], uid[6], uid[7]);
+
+    uint8_t readback[4] = {0};
+
+    /* 1. Write and verify block 0x10 */
+    if(!write_single_block_verified(iso, ISO15_GEN3_BLOCK_UID_LOW, expected_10, readback)) {
+        FURI_LOG_E(
+            TAG,
+            "Gen3 UID block 0x10 failed: readback=[%02X %02X %02X %02X], expected=[%02X %02X %02X %02X]",
+            readback[0], readback[1], readback[2], readback[3],
+            expected_10[0], expected_10[1], expected_10[2], expected_10[3]);
+        return WriteResultUidCmdFailed;
+    }
+
+    furi_delay_ms(SLI_EEPROM_WRITE_DELAY_MS);
+
+    /* 2. Write and verify block 0x11 */
+    memset(readback, 0, sizeof(readback));
+    if(!write_single_block_verified(iso, ISO15_GEN3_BLOCK_UID_HIGH, expected_11, readback)) {
+        FURI_LOG_E(
+            TAG,
+            "Gen3 UID block 0x11 failed (block 0x10 already written!): readback=[%02X %02X %02X %02X], expected=[%02X %02X %02X %02X]",
+            readback[0], readback[1], readback[2], readback[3],
+            expected_11[0], expected_11[1], expected_11[2], expected_11[3]);
+        return WriteResultGen3UidPartial;
+    }
+
+    /* 3. Verification inventory: ensure canonical RF UID matches target exactly */
+    furi_delay_ms(50);
+    uint8_t actual_uid[8] = {0};
+    bool inventory_received = false;
+
+    for(int attempt = 0; attempt < 5; attempt++) {
+        if(iso15693_3_poller_inventory(iso, actual_uid) == Iso15693_3ErrorNone) {
+            inventory_received = true;
+            FURI_LOG_I(
+                TAG,
+                "Gen3 Inventory UID: %02X%02X%02X%02X%02X%02X%02X%02X",
+                actual_uid[0], actual_uid[1], actual_uid[2], actual_uid[3],
+                actual_uid[4], actual_uid[5], actual_uid[6], actual_uid[7]);
+
+            if(memcmp(actual_uid, uid, 8) == 0) {
+                return WriteResultOk;
+            }
+        }
+        if(attempt + 1 < 5) {
+            furi_delay_ms(25);
+        }
+    }
+
+    if(!inventory_received) {
+        FURI_LOG_E(TAG, "Gen3 inventory verification failed: card not responding");
+        return WriteResultUidReadbackUnavailable;
+    }
+
+    FURI_LOG_E(TAG, "Gen3 inventory verification failed: UID does not match target!");
+    return WriteResultUidMismatch;
+}
+
+/* ============================================================================
  *  SELECT helper (puts card in selected state, non-fatal if no response)
  * ========================================================================== */
 
 static void select_card(Iso15693_3Poller* iso, const uint8_t uid_msb[8]) {
-    BitBuffer* tx = bit_buffer_alloc(10 * 8);
+    BitBuffer* tx = bit_buffer_alloc(10);
     if(!tx) return;
     bit_buffer_append_byte(tx, 0x22);  /* high rate + addressed */
     bit_buffer_append_byte(tx, ISO15693_CMD_SELECT);
@@ -281,38 +584,53 @@ static void select_card(Iso15693_3Poller* iso, const uint8_t uid_msb[8]) {
 }
 
 /* ============================================================================
- *  Normal block read helper (non-addressed, flags=0x02)
+ *  Block verification helper (reads back and verifies data blocks)
  * ========================================================================== */
 
-static bool read_block(Iso15693_3Poller* iso, uint8_t block_number, uint8_t data[4]) {
-    uint8_t frame[3];
-    frame[0] = 0x02; /* High data rate */
-    frame[1] = ISO15693_CMD_READ_BLOCK;
-    frame[2] = block_number;
+static WriteResult verify_blocks(
+    Iso15693_3Poller* iso,
+    const uint8_t uid_msb[8],
+    const uint8_t* data,
+    size_t blocks,
+    uint8_t block_size)
+{
+    FURI_LOG_I(TAG, "Verifying %u written blocks...", (unsigned)blocks);
+    furi_delay_ms(30);
 
-    BitBuffer* tx = bb_alloc_from(frame, sizeof(frame));
-    if(!tx) return false;
-    BitBuffer* rx = bb_alloc_rx(16);
-    if(!rx) {
-        bit_buffer_free(tx);
-        return false;
-    }
+    for(size_t b = 0; b < blocks; b++) {
+        uint8_t readback[4] = {0};
+        bool verified_block = false;
 
-    Iso15693_3Error err = iso15693_3_poller_send_frame(iso, tx, rx, ISO15693_FWT_FC);
-    bool ok = (err == Iso15693_3ErrorNone) && iso_reply_ok(rx);
-    size_t rxsz = bit_buffer_get_size_bytes(rx);
-
-    if(ok && rxsz >= 5) {
-        for(size_t i = 0; i < 4; i++) {
-            data[i] = bit_buffer_get_byte(rx, 1 + i);
+        for(int attempt = 0; attempt < SLI_BLOCK_WRITE_RETRIES; attempt++) {
+            if(read_single_block(iso, uid_msb, (uint8_t)b, readback) == BlockReadOk) {
+                if(memcmp(readback, &data[b * block_size], block_size) == 0) {
+                    verified_block = true;
+                    break;
+                }
+                FURI_LOG_W(
+                    TAG,
+                    "Block %u readback mismatch (attempt %d): [%02X %02X %02X %02X] != [%02X %02X %02X %02X]",
+                    (unsigned)b,
+                    attempt,
+                    readback[0], readback[1], readback[2], readback[3],
+                    data[b * block_size],
+                    data[b * block_size + 1],
+                    data[b * block_size + 2],
+                    data[b * block_size + 3]);
+            }
+            if(attempt + 1 < SLI_BLOCK_WRITE_RETRIES) {
+                furi_delay_ms(SLI_EEPROM_WRITE_DELAY_MS);
+            }
         }
-    } else {
-        ok = false;
+
+        if(!verified_block) {
+            FURI_LOG_E(TAG, "Block %u readback verification failed!", (unsigned)b);
+            return WriteResultBlockVerifyFailed;
+        }
     }
 
-    bit_buffer_free(tx);
-    bit_buffer_free(rx);
-    return ok;
+    FURI_LOG_I(TAG, "All %u blocks verified successfully!", (unsigned)blocks);
+    return WriteResultOk;
 }
 
 /* ============================================================================
@@ -339,99 +657,33 @@ static WriteResult write_blocks(
         if(block_size < 4) memset(&wframe[3 + block_size], 0x00, 4 - block_size);
 
         bool wrote = false;
-        for(int attempt = 0; attempt < 5 && !wrote; attempt++) {
+        for(int attempt = 0; attempt < SLI_BLOCK_WRITE_RETRIES && !wrote; attempt++) {
             wrote = iso_send_raw(iso, wframe, sizeof(wframe), ISO15693_FWT_FC);
             if(!wrote) {
+                furi_delay_ms(SLI_EEPROM_WRITE_DELAY_MS);
+                /* Check if EEPROM burn succeeded despite dropped response ACK */
+                uint8_t current[4] = {0};
+                if(read_single_block(iso, NULL, (uint8_t)b, current) == BlockReadOk &&
+                   memcmp(current, &wframe[3], 4) == 0) {
+                    FURI_LOG_I(TAG, "Block %u: verified via read-back despite missing ACK", (unsigned)b);
+                    wrote = true;
+                    break;
+                }
                 if(wframe[0] == 0x02) {
                     FURI_LOG_W(TAG, "Block %u: retrying with Option flag (0x42)", (unsigned)b);
                     wframe[0] = 0x42;
                 }
-                furi_delay_ms(20);
             }
         }
         if(!wrote) {
             FURI_LOG_E(TAG, "write_blocks: block %u failed", (unsigned)b);
             return WriteResultBlockWriteFailed;
         }
-        furi_delay_ms(20);
+        furi_delay_ms(SLI_EEPROM_WRITE_DELAY_MS);
     }
 
     /* Strict read-back verification: read every written block back and verify */
-    FURI_LOG_I(TAG, "Verifying %u written blocks...", (unsigned)blocks);
-    furi_delay_ms(30);
-
-    for(size_t b = 0; b < blocks; b++) {
-        uint8_t readback[4] = {0};
-        bool verified_block = false;
-
-        for(int attempt = 0; attempt < 5; attempt++) {
-            if(read_block(iso, (uint8_t)b, readback)) {
-                if(memcmp(readback, &data[b * block_size], block_size) == 0) {
-                    verified_block = true;
-                    break;
-                }
-                FURI_LOG_W(
-                    TAG,
-                    "Block %u readback mismatch (attempt %d): [%02X %02X %02X %02X] != [%02X %02X %02X %02X]",
-                    (unsigned)b,
-                    attempt,
-                    readback[0], readback[1], readback[2], readback[3],
-                    data[b * block_size],
-                    data[b * block_size + 1],
-                    data[b * block_size + 2],
-                    data[b * block_size + 3]);
-            }
-            furi_delay_ms(20);
-        }
-
-        if(!verified_block) {
-            FURI_LOG_E(TAG, "Block %u readback verification failed!", (unsigned)b);
-            return WriteResultBlockVerifyFailed;
-        }
-    }
-
-    FURI_LOG_I(TAG, "All %u blocks verified successfully!", (unsigned)blocks);
-    return WriteResultOk;
-}
-
-/* ============================================================================
- *  Special block read helper (addressed, flags=0x22)
- * ========================================================================== */
-
-static bool read_block_addressed(
-    Iso15693_3Poller* iso,
-    const uint8_t uid_msb[8],
-    uint8_t block_number,
-    uint8_t data[4])
-{
-    BitBuffer* tx = bit_buffer_alloc(11 * 8);
-    if(!tx) return false;
-    bit_buffer_append_byte(tx, 0x22); /* High data rate + Addressed */
-    bit_buffer_append_byte(tx, ISO15693_CMD_READ_BLOCK);
-    append_uid_wire_order(tx, uid_msb);
-    bit_buffer_append_byte(tx, block_number);
-
-    BitBuffer* rx = bb_alloc_rx(16);
-    if(!rx) {
-        bit_buffer_free(tx);
-        return false;
-    }
-
-    Iso15693_3Error err = iso15693_3_poller_send_frame(iso, tx, rx, ISO15693_FWT_FC);
-    bool ok = (err == Iso15693_3ErrorNone) && iso_reply_ok(rx);
-    size_t rxsz = bit_buffer_get_size_bytes(rx);
-
-    if(ok && rxsz >= 5) {
-        for(size_t i = 0; i < 4; i++) {
-            data[i] = bit_buffer_get_byte(rx, 1 + i);
-        }
-    } else {
-        ok = false;
-    }
-
-    bit_buffer_free(tx);
-    bit_buffer_free(rx);
-    return ok;
+    return verify_blocks(iso, NULL, data, blocks, block_size);
 }
 
 /* ============================================================================
@@ -452,7 +704,7 @@ static WriteResult write_blocks_addressed(
     FURI_LOG_I(TAG, "write_blocks_addressed: %u blocks (flags=0x62)", (unsigned)blocks);
 
     for(size_t b = 0; b < blocks; b++) {
-        BitBuffer* tx = bit_buffer_alloc(15 * 8);
+        BitBuffer* tx = bit_buffer_alloc(15);
         if(!tx) return WriteResultBlockWriteFailed;
         bit_buffer_append_byte(tx, 0x62);
         bit_buffer_append_byte(tx, ISO15693_CMD_WRITE_BLOCK);
@@ -495,63 +747,34 @@ static WriteResult write_blocks_addressed(
     }
 
     /* Strict read-back verification: read every written block back and verify */
-    FURI_LOG_I(TAG, "Verifying %u written blocks...", (unsigned)blocks);
-    furi_delay_ms(30);
-
-    for(size_t b = 0; b < blocks; b++) {
-        uint8_t readback[4] = {0};
-        bool verified_block = false;
-
-        for(int attempt = 0; attempt < 5; attempt++) {
-            if(read_block_addressed(iso, uid_msb, (uint8_t)b, readback)) {
-                if(memcmp(readback, &data[b * block_size], block_size) == 0) {
-                    verified_block = true;
-                    break;
-                }
-                FURI_LOG_W(
-                    TAG,
-                    "Block %u readback mismatch (attempt %d): [%02X %02X %02X %02X] != [%02X %02X %02X %02X]",
-                    (unsigned)b,
-                    attempt,
-                    readback[0], readback[1], readback[2], readback[3],
-                    data[b * block_size],
-                    data[b * block_size + 1],
-                    data[b * block_size + 2],
-                    data[b * block_size + 3]);
-            }
-            furi_delay_ms(20);
-        }
-
-        if(!verified_block) {
-            FURI_LOG_E(TAG, "Block %u readback verification failed!", (unsigned)b);
-            return WriteResultBlockVerifyFailed;
-        }
-    }
-
-    FURI_LOG_I(TAG, "All %u blocks verified successfully!", (unsigned)blocks);
-    return WriteResultOk;
+    return verify_blocks(iso, uid_msb, data, blocks, block_size);
 }
 
 /* ============================================================================
  *  Persistent special UID storage
  * ========================================================================== */
 
-bool sli_writer_save_special_uid(SliWriterApp* app) {
+bool sli_writer_save_special_uid(SliWriterApp* app, const uint8_t candidate_uid[8]) {
     storage_common_mkdir(app->storage, "/ext/apps_data/sli_writer");
 
     File* f = storage_file_alloc(app->storage);
     bool ok = false;
     if(storage_file_open(f, SLI_SPECIAL_UID_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
-        ok = (storage_file_write(f, app->special_uid, 8) == 8);
+        ok = (storage_file_write(f, candidate_uid, 8) == 8);
         storage_file_close(f);
     }
     storage_file_free(f);
-    if(ok) FURI_LOG_I(TAG, "Special UID saved: %02X%02X%02X%02X%02X%02X%02X%02X",
-                      app->special_uid[0], app->special_uid[1],
-                      app->special_uid[2], app->special_uid[3],
-                      app->special_uid[4], app->special_uid[5],
-                      app->special_uid[6], app->special_uid[7]);
-    else   FURI_LOG_E(TAG, "Special UID save failed");
+    if(ok) {
+        memcpy(app->special_uid, candidate_uid, 8);
+        app->special_uid_saved = true;
+        FURI_LOG_I(TAG, "Special UID saved: %02X%02X%02X%02X%02X%02X%02X%02X",
+                   app->special_uid[0], app->special_uid[1],
+                   app->special_uid[2], app->special_uid[3],
+                   app->special_uid[4], app->special_uid[5],
+                   app->special_uid[6], app->special_uid[7]);
+    } else {
+        FURI_LOG_E(TAG, "Special UID save failed");
+    }
     return ok;
 }
 
@@ -575,8 +798,58 @@ bool sli_writer_load_special_uid(SliWriterApp* app) {
 }
 
 /* ============================================================================
- *  .nfc file parser
+ *  .nfc file parser (line-anchored, field-bounded)
  * ========================================================================== */
+
+static const char* find_line_key(const char* buf, const char* key) {
+    size_t key_len = strlen(key);
+    const char* p = buf;
+    while(p && *p) {
+        if(strncmp(p, key, key_len) == 0) {
+            return p + key_len;
+        }
+        p = strchr(p, '\n');
+        if(p) p++;
+    }
+    return NULL;
+}
+
+static const char* find_line_end(const char* p) {
+    while(*p && *p != '\r' && *p != '\n') {
+        p++;
+    }
+    return p;
+}
+
+static size_t parse_hex_bytes_bounded(
+    const char* start,
+    const char* end,
+    uint8_t* out,
+    size_t max_bytes)
+{
+    size_t count = 0;
+    const char* q = start;
+
+    while(q < end && count < max_bytes) {
+        while(q < end && (*q == ' ' || *q == '\t')) q++;
+        if(q >= end) break;
+
+        char* token_end = NULL;
+        long val = strtol(q, &token_end, 16);
+        if(token_end == q || token_end > end || val < 0 || val > 0xFF) {
+            break;
+        }
+        out[count++] = (uint8_t)val;
+        q = token_end;
+    }
+
+    while(q < end && (*q == ' ' || *q == '\t')) q++;
+    if(q < end) {
+        return 0;
+    }
+
+    return count;
+}
 
 bool sli_writer_parse_nfc_file(SliWriterApp* app, const char* path) {
     File* f = storage_file_alloc(app->storage);
@@ -592,64 +865,50 @@ bool sli_writer_parse_nfc_file(SliWriterApp* app, const char* path) {
             size_t n = storage_file_read(f, buf, sz);
             buf[n] = '\0';
 
-            char* p;
-            size_t uid_count = 0;
+            const char* p;
 
-            if((p = strstr(buf, "UID: "))) {
-                p += 5;
-                char* q = p;
-                for(int i = 0; i < 8; i++) {
-                    while(*q == ' ') q++;
-                    char* end = NULL;
-                    long val = strtol(q, &end, 16);
-                    if(end == q || val < 0 || val > 0xFF) break;
-                    app->nfc_data.uid[i] = (uint8_t)val;
-                    q = end;
-                    uid_count++;
-                }
-            }
-
-            if((p = strstr(buf, "Block Count: "))) {
+            /* 1. Parse Block Count */
+            if((p = find_line_key(buf, "Block Count:"))) {
+                while(*p == ' ' || *p == '\t') p++;
                 char* end = NULL;
-                long val = strtol(p + 13, &end, 0);
-                if(val > 0 && val <= SLI_MAGIC_MAX_BLOCKS) {
+                long val = strtol(p, &end, 10);
+                if(end != p && val > 0 && val <= SLI_MAGIC_MAX_BLOCKS) {
                     app->nfc_data.block_count = (uint8_t)val;
                 }
             }
 
-            if((p = strstr(buf, "Block Size: "))) {
+            /* 2. Parse Block Size */
+            if((p = find_line_key(buf, "Block Size:"))) {
+                while(*p == ' ' || *p == '\t') p++;
                 char* end = NULL;
-                long val = strtol(p + 12, &end, 0);
-                if(val > 0 && val <= 255) {
+                long val = strtol(p, &end, 10);
+                if(end != p && val > 0 && val <= 255) {
                     app->nfc_data.block_size = (uint8_t)val;
                 }
             }
 
+            /* 3. Parse UID (must be exactly 8 bytes on UID line) */
+            size_t uid_count = 0;
+            if((p = find_line_key(buf, "UID:"))) {
+                while(*p == ' ' || *p == '\t') p++;
+                const char* line_end = find_line_end(p);
+                uid_count = parse_hex_bytes_bounded(p, line_end, app->nfc_data.uid, 8);
+            }
+
+            /* 4. Parse Data Content (must be exactly block_count * block_size bytes on line) */
             size_t data_bytes_parsed = 0;
             size_t expected_total = (size_t)app->nfc_data.block_count * app->nfc_data.block_size;
 
             if(expected_total > 0 && expected_total <= sizeof(app->nfc_data.data)) {
-                if((p = strstr(buf, "Data Content: "))) {
-                    p += 14;
-                    char* q2 = p;
-                    for(size_t i = 0; i < expected_total; i++) {
-                        while(*q2 == ' ' || *q2 == '\r' || *q2 == '\n' || *q2 == '\t') q2++;
-                        if(*q2 == '\0') break;
-                        char* end2 = NULL;
-                        long val = strtol(q2, &end2, 16);
-                        if(end2 == q2 || val < 0 || val > 0xFF) break;
-                        app->nfc_data.data[i] = (uint8_t)val;
-                        q2 = end2;
-                        data_bytes_parsed++;
-                    }
+                if((p = find_line_key(buf, "Data Content:"))) {
+                    while(*p == ' ' || *p == '\t') p++;
+                    const char* line_end = find_line_end(p);
+                    data_bytes_parsed = parse_hex_bytes_bounded(
+                        p, line_end, app->nfc_data.data, expected_total);
                 }
             }
 
-            /* Strict validation to prevent partial / zero-filled data from reaching writer:
-             * 1. Exact 8-byte UID
-             * 2. block_count between 1 and SLI_MAGIC_MAX_BLOCKS
-             * 3. block_size == 4
-             * 4. Data Content contains exactly block_count * block_size valid bytes */
+            /* 5. Validate all parsed fields */
             if(uid_count != 8) {
                 furi_string_set(app->error_message, "Invalid UID in .nfc");
                 FURI_LOG_E(TAG, "Parse error: expected 8 UID bytes, found %u", (unsigned)uid_count);
@@ -661,8 +920,8 @@ bool sli_writer_parse_nfc_file(SliWriterApp* app, const char* path) {
                 FURI_LOG_E(TAG, "Parse error: unsupported block size %u", (unsigned)app->nfc_data.block_size);
             } else if(data_bytes_parsed != expected_total) {
                 furi_string_set(app->error_message, "Incomplete data in .nfc file");
-                FURI_LOG_E(TAG, "Parse error: incomplete data %u / %u bytes",
-                           (unsigned)data_bytes_parsed, (unsigned)expected_total);
+                FURI_LOG_E(TAG, "Parse error: expected %u data bytes, found %u",
+                           (unsigned)expected_total, (unsigned)data_bytes_parsed);
             } else {
                 FURI_LOG_I(TAG, "Parsed valid .nfc: blocks=%u size=%u uid=%02X%02X%02X%02X%02X%02X%02X%02X",
                            app->nfc_data.block_count, app->nfc_data.block_size,
@@ -674,6 +933,8 @@ bool sli_writer_parse_nfc_file(SliWriterApp* app, const char* path) {
             }
 
             free(buf);
+        } else {
+            furi_string_set(app->error_message, "Out of memory reading file");
         }
         storage_file_close(f);
     } else {
@@ -691,7 +952,7 @@ bool sli_writer_parse_nfc_file(SliWriterApp* app, const char* path) {
  *  Write operations
  * ========================================================================== */
 
-/* Normal write: SELECT -> write blocks (non-addressed) -> write UID */
+/* Normal write: detect -> sanity-check -> write blocks -> re-verify sig -> write UID */
 static WriteResult do_normal_write(SliWriterApp* app, Iso15693_3Poller* iso) {
     if(app->nfc_data.block_count == 0 || app->nfc_data.block_size != 4) {
         FURI_LOG_E(TAG, "Cannot write: invalid or incomplete NFC data");
@@ -699,31 +960,98 @@ static WriteResult do_normal_write(SliWriterApp* app, Iso15693_3Poller* iso) {
         return WriteResultBlockWriteFailed;
     }
 
+    /* 1. Detect Gen3 magic tag BEFORE any write operation */
+    Gen3Detection gen3 = detect_gen3(iso);
+
+    if(gen3 == GEN3_UNKNOWN) {
+        FURI_LOG_E(TAG, "Cannot safely identify tag (read/comm error on signature blocks)");
+        furi_string_set(app->error_message, "Cannot safely identify tag");
+        return WriteResultCardLost;
+    }
+
+    if(gen3 == GEN3_YES) {
+        FURI_LOG_I(TAG, "Detected ISO15693 Gen3 magic tag");
+
+        /* Hard safety restrictions for Tonie Gen3 workflow */
+        if(app->nfc_data.block_count != 8 || app->nfc_data.block_size != 4) {
+            FURI_LOG_E(
+                TAG,
+                "Unsafe Gen3 source layout: %u blocks x %u bytes (expected 8x4)",
+                app->nfc_data.block_count,
+                app->nfc_data.block_size);
+            furi_string_set(app->error_message, "Unsafe Gen3 layout (must be 8x4)");
+            return WriteResultBlockWriteFailed;
+        }
+
+        if(app->nfc_data.uid[0] != 0xE0 || app->nfc_data.uid[1] != 0x04 || app->nfc_data.uid[2] != 0x03) {
+            FURI_LOG_E(
+                TAG,
+                "Invalid Tonie Gen3 UID: %02X %02X %02X ... (expected E0 04 03)",
+                app->nfc_data.uid[0],
+                app->nfc_data.uid[1],
+                app->nfc_data.uid[2]);
+            furi_string_set(app->error_message, "Invalid UID (expected E0 04 03)");
+            return WriteResultBlockWriteFailed;
+        }
+    } else {
+        FURI_LOG_I(TAG, "Standard / Gen2 ISO15693 tag detected");
+    }
+
+    /* 2. Select card and write data blocks */
     select_card(iso, app->detected_uid);
     furi_delay_ms(10);
 
-    FURI_LOG_I(TAG, "Normal write: %u blocks", app->nfc_data.block_count);
-    WriteResult b_res = write_blocks(iso, app->nfc_data.data,
-                                     app->nfc_data.block_count, app->nfc_data.block_size);
+    uint8_t blocks_to_write = app->nfc_data.block_count;
+    FURI_LOG_I(TAG, "Normal write: %u blocks", blocks_to_write);
+    WriteResult b_res = write_blocks(iso, app->nfc_data.data, blocks_to_write, app->nfc_data.block_size);
     if(b_res != WriteResultOk) {
         return b_res;
     }
-    FURI_LOG_I(TAG, "Blocks OK");
+    FURI_LOG_I(TAG, "Blocks written and verified OK");
 
+    /* If Gen3, confirm signature blocks 0x14/0x15 remain intact after data writes */
+    if(gen3 == GEN3_YES) {
+        furi_delay_ms(20);
+        Gen3Detection verify_sig = detect_gen3(iso);
+        if(verify_sig != GEN3_YES) {
+            FURI_LOG_E(TAG, "Gen3 signature verification failed after block writes!");
+            furi_string_set(app->error_message, "Gen3 sig altered or lost!");
+            return WriteResultBlockVerifyFailed;
+        }
+    }
+
+    /* 3. Write target UID if needed */
     static const uint8_t zero_uid[8] = {0};
     if(memcmp(app->nfc_data.uid, zero_uid, 8) != 0 &&
        memcmp(app->nfc_data.uid, app->detected_uid, 8) != 0) {
         furi_delay_ms(30);
-        if(!reset_card_to_ready(iso, NULL)) {
-            FURI_LOG_E(TAG, "Card not responding after data block write");
+        if(!reset_card_to_ready(iso, app->detected_uid)) {
+            FURI_LOG_E(TAG, "Card not responding or UID changed after data block write");
             return WriteResultCardLost;
         }
         furi_delay_ms(20);
 
-        FURI_LOG_I(TAG, "Writing target UID...");
-        WriteResult res = magic_write_uid(iso, app->nfc_data.uid);
-        if(res != WriteResultOk) {
-            return res;
+        if(gen3 == GEN3_YES) {
+            FURI_LOG_I(TAG, "Writing Gen3 target UID...");
+            WriteResult res = gen3_write_uid(iso, app->nfc_data.uid);
+            if(res != WriteResultOk) {
+                if(res == WriteResultGen3UidPartial) {
+                    furi_string_set(app->error_message, "Partial UID written!");
+                } else if(res == WriteResultUidMismatch) {
+                    furi_string_set(app->error_message, "UID verify mismatch");
+                } else if(res == WriteResultUidReadbackUnavailable) {
+                    furi_string_set(app->error_message, "Card lost during UID verify");
+                } else {
+                    furi_string_set(app->error_message, "Gen3 UID write failed");
+                }
+                return res;
+            }
+        } else {
+            FURI_LOG_I(TAG, "Writing Gen2 target UID...");
+            WriteResult res = magic_write_uid(iso, app->nfc_data.uid);
+            if(res != WriteResultOk) {
+                return res;
+            }
         }
         FURI_LOG_I(TAG, "UID OK");
     } else {
@@ -741,6 +1069,19 @@ static WriteResult do_special_write(SliWriterApp* app, Iso15693_3Poller* iso) {
         FURI_LOG_E(TAG, "Cannot write: invalid or incomplete NFC data");
         furi_string_set(app->error_message, "Incomplete NFC data");
         return WriteResultBlockWriteFailed;
+    }
+
+    /* Gen3 tags do NOT use Special mode — detect immediately and refuse */
+    Gen3Detection gen3 = detect_gen3(iso);
+    if(gen3 == GEN3_YES) {
+        FURI_LOG_W(TAG, "Gen3 tag detected in Special mode; refusing write");
+        furi_string_set(app->error_message, "Gen3: use Normal write");
+        return WriteResultBlockWriteFailed;
+    }
+    if(gen3 == GEN3_UNKNOWN) {
+        FURI_LOG_E(TAG, "Cannot safely identify tag in Special mode");
+        furi_string_set(app->error_message, "Cannot safely identify tag");
+        return WriteResultCardLost;
     }
 
     FURI_LOG_I(TAG, "Special write: factory=%02X%02X.. target=%02X%02X..",
@@ -841,6 +1182,8 @@ static const char* write_result_get_message(WriteResult result) {
         return "UID verify mismatch";
     case WriteResultSaveUidFailed:
         return "Failed to save UID to SD";
+    case WriteResultGen3UidPartial:
+        return "Partial UID written!";
     default:
         return "Write failed";
     }
@@ -879,9 +1222,14 @@ static NfcCommand sli_poller_callback(NfcGenericEvent event, void* context) {
     if(iso_event->type != Iso15693_3PollerEventTypeReady)
         return NfcCommandContinue;
 
-    Iso15693_3Poller* iso = event.instance;
-    app->is_writing = true;
+    /* Atomically ensure we don't start writing if scene was cancelled or stopping */
+    if(app->worker_state != SliWriterWorkerStateIdle) {
+        return NfcCommandStop;
+    }
+    app->worker_state = SliWriterWorkerStateWriting;
     view_dispatcher_send_custom_event(app->view_dispatcher, SliWriterCustomEventWriteStarted);
+
+    Iso15693_3Poller* iso = event.instance;
 
     uint8_t inventory_uid[8];
     Iso15693_3Error uid_err = iso15693_3_poller_inventory(iso, inventory_uid);
@@ -892,7 +1240,6 @@ static NfcCommand sli_poller_callback(NfcGenericEvent event, void* context) {
     }
 
     memcpy(app->detected_uid, inventory_uid, 8);
-    app->have_uid = true;
     FURI_LOG_I(TAG, "Card UID: %02X%02X%02X%02X%02X%02X%02X%02X",
                app->detected_uid[0], app->detected_uid[1],
                app->detected_uid[2], app->detected_uid[3],
@@ -902,9 +1249,7 @@ static NfcCommand sli_poller_callback(NfcGenericEvent event, void* context) {
 
     switch(app->write_mode) {
     case SliWriterModeSaveUid:
-        memcpy(app->special_uid, app->detected_uid, 8);
-        app->special_uid_saved = true;
-        if(sli_writer_save_special_uid(app)) {
+        if(sli_writer_save_special_uid(app, app->detected_uid)) {
             app->write_result = WriteResultOk;
         } else {
             app->write_result = WriteResultSaveUidFailed;
@@ -1110,13 +1455,10 @@ void sli_writer_scene_write_on_enter(void* context) {
     notification_message(notif, &seq_blink_start);
     furi_record_close(RECORD_NOTIFICATION);
 
-    app->have_uid = false;
-    app->is_writing = false;
+    app->worker_state = SliWriterWorkerStateIdle;
     furi_string_reset(app->error_message);
 
     app->poller = nfc_poller_alloc(app->nfc, NfcProtocolIso15693_3);
-    app->nfc_started = true;
-
     nfc_poller_start(app->poller, sli_poller_callback, app);
     FURI_LOG_I(TAG, "Poller started, mode=%d", (int)app->write_mode);
 }
@@ -1128,9 +1470,10 @@ bool sli_writer_scene_write_on_event(void* context, SceneManagerEvent event) {
        (event.type == SceneManagerEventTypeCustom &&
         event.event == (SLI_DIALOG_RESULT_OFFSET + DialogExResultLeft))) {
         /* Consume Back while write is in progress to prevent UI freeze and partial write */
-        if(app->is_writing) {
+        if(app->worker_state == SliWriterWorkerStateWriting) {
             return true;
         }
+        app->worker_state = SliWriterWorkerStateStopping;
         scene_manager_search_and_switch_to_previous_scene(
             app->scene_manager, SliWriterSceneStart);
         return true;
@@ -1153,12 +1496,11 @@ bool sli_writer_scene_write_on_event(void* context, SceneManagerEvent event) {
 
 void sli_writer_scene_write_on_exit(void* context) {
     SliWriterApp* app = context;
-    app->is_writing = false;
+    app->worker_state = SliWriterWorkerStateStopping;
     if(app->poller) {
         nfc_poller_stop(app->poller);
         nfc_poller_free(app->poller);
-        app->poller      = NULL;
-        app->nfc_started = false;
+        app->poller = NULL;
     }
 }
 
@@ -1266,10 +1608,6 @@ SliWriterApp* sli_writer_app_alloc(void) {
     view_dispatcher_add_view(app->view_dispatcher,
         SliWriterViewDialogEx, dialog_ex_get_view(app->dialog_ex));
 
-    app->loading = loading_alloc();
-    view_dispatcher_add_view(app->view_dispatcher,
-        SliWriterViewLoading, loading_get_view(app->loading));
-
     app->file_path     = furi_string_alloc();
     app->error_message = furi_string_alloc();
 
@@ -1298,11 +1636,9 @@ void sli_writer_app_free(SliWriterApp* app) {
 
     view_dispatcher_remove_view(app->view_dispatcher, SliWriterViewSubmenu);
     view_dispatcher_remove_view(app->view_dispatcher, SliWriterViewDialogEx);
-    view_dispatcher_remove_view(app->view_dispatcher, SliWriterViewLoading);
 
     submenu_free(app->submenu);
     dialog_ex_free(app->dialog_ex);
-    loading_free(app->loading);
 
     view_dispatcher_free(app->view_dispatcher);
     scene_manager_free(app->scene_manager);

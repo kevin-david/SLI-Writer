@@ -2,3 +2,4 @@ Flipper/.vscode/
 Flipper/dist/
 .ufbt/
 *.elf
+tests/test_gen3_regression
